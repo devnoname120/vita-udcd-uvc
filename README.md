@@ -48,32 +48,8 @@ ur0:tai/udcd_uvc.skprx
 
 ## Listening to audio on macOS
 
-The audio function appears as an input device named `PSVita`. Applications
-that read it through CoreAudio receive 48 kHz stereo audio directly.
-
-The `avfoundation` input in the tested Homebrew FFmpeg 8.1.2 build drops some
-audio sample buffers even though CoreAudio receives a continuous stream. For
-reliable command-line playback, build the included CoreAudio bridge and pipe
-its unchanged 32-bit float samples to `ffplay`:
-
-```sh
-clang -std=c11 -D_DARWIN_C_SOURCE -O2 -Wall -Wextra \
-  -framework CoreAudio -framework CoreFoundation \
-  tools/coreaudio-stream.c -o tools/coreaudio-stream
-
-tools/coreaudio-stream PSVita | \
-  ffplay -nodisp -f f32le -ar 48000 -ch_layout stereo -i pipe:0
-```
-
-To make a lossless command-line recording instead:
-
-```sh
-tools/coreaudio-stream PSVita | \
-  ffmpeg -f f32le -ar 48000 -ch_layout stereo -i pipe:0 \
-    -c:a pcm_f32le vita-audio.wav
-```
-
-Press Ctrl-C to stop either pipeline.
+On macOS, FFmpeg versions older than 8.1.3 have an audio bug that prevents
+sound from working correctly. Upgrade to FFmpeg 8.1.3 or later.
 
 ## Troubleshooting
 
