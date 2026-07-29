@@ -25,13 +25,13 @@
 #define AUDIO_RING_TARGET_FRAMES		1024
 
 /*
- * Keep the UAC wire cadence at one 192-byte packet per millisecond, but give
- * SceUdcd four packets per request. The controller splits each request at the
- * endpoint's wMaxPacketSize, reducing completion/requeue work without changing
- * the host-visible 48 kHz stereo format.
+ * Keep one SceUdcd request per one-millisecond UAC transaction. SceUdcd
+ * accepts larger requests, but batching multiple isochronous transactions
+ * makes the macOS host stream discontinuous even when the request reports
+ * that every byte was transmitted.
  */
 #define AUDIO_USB_QUEUE_DEPTH			32
-#define AUDIO_USB_REQUEST_INTERVALS		4
+#define AUDIO_USB_REQUEST_INTERVALS		1
 #define AUDIO_USB_REQUEST_FRAMES		\
 	(UAC_NOMINAL_PACKET_FRAMES * AUDIO_USB_REQUEST_INTERVALS)
 #define AUDIO_USB_REQUEST_STRIDE		\
@@ -102,7 +102,7 @@ _Static_assert(AUDIO_USB_REQUEST_STRIDE >=
 	       AUDIO_USB_REQUEST_FRAMES * sizeof(AudioPcmFrame),
 	"audio USB request stride is too small");
 _Static_assert(UAC_NOMINAL_PACKET_FRAMES == UAC_MAX_PACKET_FRAMES,
-	"batched USB requests require fixed-size one-millisecond packets");
+	"USB requests require fixed-size one-millisecond packets");
 
 static SceUdcdEndpoint *g_audio_endpoint;
 static SceUID g_audio_memory_uid = -1;
