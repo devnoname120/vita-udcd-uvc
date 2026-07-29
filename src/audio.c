@@ -1,4 +1,6 @@
+#include <psp2/kernel/error.h>
 #include <psp2kern/kernel/cpu.h>
+#include <psp2kern/kernel/dmac.h>
 #include <psp2kern/kernel/sysmem.h>
 #include <psp2kern/kernel/threadmgr.h>
 #include <psp2kern/kernel/threadmgr/fast_mutex.h>
@@ -14,11 +16,68 @@
 #define ALIGN(value, alignment) \
 	(((value) + ((alignment) - 1)) & ~((alignment) - 1))
 
-#define AUDIO_MONITOR_PATH			0
-#define AUDIO_MONITOR_MODE_DISABLED		0
-#define AUDIO_MONITOR_MODE_READBACK		2
-#define AUDIO_MONITOR_STEREO			2
 #define AUDIO_CAPTURE_FRAMES			512
+#define AUDIO_CAPTURE_BUFFER_COUNT		8
+#define AUDIO_CAPTURE_INITIAL_QUEUE_DEPTH	2
+#define AUDIO_CAPTURE_BUFFER_MASK		\
+	((1u << AUDIO_CAPTURE_BUFFER_COUNT) - 1)
+
+/*
+ * SceAudio 3.60 configures three SourceMixer instances at physical bases
+ * E04A0000, E04B0000 and E04C0000. SourceMixer0 proves that +0x240 is an
+ * auxiliary PCM FIFO and register 39 (+0x9C) controls it independently from
+ * the main FIFO at +0x200/register 38 (+0x98).
+ *
+ * The output request sequence is 0x54000 (SrcMix0 main), 0x58000 (SrcMix0
+ * auxiliary), 0x5C000 (SrcMix1 main) and 0x64000 (SrcMix2 main). Hardware
+ * validation confirms that the symmetric 0x60000 request reads SrcMix1's
+ * auxiliary FIFO, although stock firmware never uses it. SceAudio assigns its
+ * three operations per mixer to DMAC4 channels 0 through 8, so this independent
+ * capture uses channel 9 and leaves the stock SrcMix1 main/ch5 speaker
+ * operation untouched.
+ */
+#define SRCMIX_AUX_CONTROL_REGISTER		39
+#define SRCMIX_AUX_ENABLE			0x00010001
+#define SRCMIX_AUX_DMAC_COMPLETION		0x00002000
+#define SRCMIX_AUX_DMAC_DIRECTION		0x05000000
+#define SRCMIX_AUX_DMAC_TAIL_BYTES		256
+#define SRCMIX_AUX_DMAC_BLOCK_SIZE		16
+#define SRCMIX_AUX_DMAC_ERROR_MASK		\
+	(SCE_KERNEL_DMAC_STAT_ABORTED |		\
+	 SCE_KERNEL_DMAC_STAT_ERROR_READ |	\
+	 SCE_KERNEL_DMAC_STAT_ERROR_WRITE |	\
+	 SCE_KERNEL_DMAC_STAT_ERROR_ILLEGAL_CONFIG | \
+	 SCE_KERNEL_DMAC_STAT_ERROR_TAG |	\
+	 SCE_KERNEL_DMAC_STAT_ERROR_ZERO_BYTE)
+
+/*
+ * Runtime layout guards for the 3.60 SceAudio data segment. This project is
+ * already firmware-specific, but checking the neighboring initialized tags
+ * prevents an unknown SceAudio build from turning these offsets into unsafe
+ * MMIO writes.
+ */
+#define SCE_AUDIO_SRCMIX0_AUX_SOURCE_OFFSET	0xBA48
+#define SCE_AUDIO_SRCMIX0_AUX_DEST_OFFSET	0xBA4C
+#define SCE_AUDIO_SRCMIX0_AUX_COMMAND_OFFSET	0xBAB0
+#define SCE_AUDIO_SRCMIX1_MAIN_SOURCE_OFFSET	0xBAB4
+#define SCE_AUDIO_SRCMIX1_MAIN_DEST_OFFSET	0xBAB8
+#define SCE_AUDIO_SRCMIX1_MAIN_COMMAND_OFFSET	0xBB1C
+#define SCE_AUDIO_SRCMIX1_REGS_POINTER_OFFSET	0xBB24
+#define SCE_AUDIO_SRCMIX2_MAIN_SOURCE_OFFSET	0xBC20
+#define SCE_AUDIO_SRCMIX2_MAIN_COMMAND_OFFSET	0xBC88
+
+#define SCE_AUDIO_SRCMIX0_AUX_FIFO_PHYSICAL	0xE04A0240
+#define SCE_AUDIO_SRCMIX0_AUX_DMAC_COMMAND	0x00058000
+#define SCE_AUDIO_SRCMIX1_MAIN_FIFO_PHYSICAL	0xE04B0200
+#define SCE_AUDIO_SRCMIX1_MAIN_DMAC_COMMAND	0x0005C000
+#define SCE_AUDIO_SRCMIX2_MAIN_FIFO_PHYSICAL	0xE04C0200
+#define SCE_AUDIO_SRCMIX2_MAIN_DMAC_COMMAND	0x02064000
+
+#define SRCMIX_AUX_DMAC_CHANNEL			9
+#define SRCMIX_AUX_FIFO_PHYSICAL		((const void *)0xE04B0240)
+#define SRCMIX_AUX_DMAC_COMMAND			0x00060000
+#define SCE_AUDIO_SRCMIX_REGS_POINTER_OFFSET	\
+	SCE_AUDIO_SRCMIX1_REGS_POINTER_OFFSET
 
 #define AUDIO_RING_FRAMES			8192
 #define AUDIO_RING_MASK				(AUDIO_RING_FRAMES - 1)
@@ -40,6 +99,7 @@
 #define AUDIO_THREAD_WAKE			0x01
 #define AUDIO_THREAD_DONE			0x02
 #define AUDIO_THREAD_EXIT			0x04
+#define AUDIO_THREAD_DMA			0x08
 
 #define AUDIO_CAPTURE_STOPPED			0x01
 #define AUDIO_USB_STOPPED			0x02
@@ -47,41 +107,23 @@
 	(AUDIO_CAPTURE_STOPPED | AUDIO_USB_STOPPED)
 
 #define AUDIO_STOP_TIMEOUT_US			1000000
-
-#define SCE_AUDIO_FOR_DRIVER_NID			0x15D711C1
-#define SCE_AUDIO_MONITOR_SET_PATH_MODE_NID	0xAC9383D0
-#define SCE_AUDIO_MONITOR_SET_RATE_NID		0x134C96C1
-#define SCE_AUDIO_MONITOR_SET_CHANNEL_MODE_NID	0xFC375BAC
-#define SCE_AUDIO_MONITOR_READ_NID		0x81EB0AE5
+#define AUDIO_DMA_TIMEOUT_US			500000
 
 /*
- * These exports are private SceAudioForDriver functions on firmware 3.60.
- * monitor_path 0 taps the final SceAudio/SourceMixer output before the
- * handheld codec applies its speaker/headphone volume and mute settings.
- *
- * Resolve them at runtime rather than importing them in the SKPRX. SceAudio
- * is not guaranteed to be loaded yet when taiHEN processes early *KERNEL
- * plugins, and a direct import would prevent this module from loading at all.
+ * SceKernelDmacMgr 3.60 services the DMAC4 group interrupt on CPU 3. Keeping
+ * the capture worker on that CPU makes stop/unload serialize with the client
+ * callback, which DmaOpQuit and DmaOpFree do not otherwise wait for.
  */
-typedef int (*AudioMonitorSetPathModeFn)(int monitor_path, int mode);
-typedef int (*AudioMonitorSetSampleRateFn)(int sample_rate);
-typedef int (*AudioMonitorSetChannelModeFn)(int channel_mode);
-typedef int (*AudioMonitorReadFn)(int monitor_path, void *pcm,
-				  int frame_count);
+#define AUDIO_CAPTURE_CPU_AFFINITY		0x00080000
+#define AUDIO_USB_CPU_AFFINITY			0x00010000
 
-int module_get_export_func(SceUID pid, const char *module_name,
-			   uint32_t library_nid, uint32_t function_nid,
-			   uintptr_t *function);
-
-static AudioMonitorSetPathModeFn g_audio_monitor_set_path_mode;
-static AudioMonitorSetSampleRateFn g_audio_monitor_set_sample_rate;
-static AudioMonitorSetChannelModeFn g_audio_monitor_set_channel_mode;
-static AudioMonitorReadFn g_audio_monitor_read;
+int module_get_offset(SceUID pid, SceUID modid, int segment_index,
+		      size_t offset, uintptr_t *address);
 
 typedef int16_t AudioPcmFrame[UAC_CHANNEL_COUNT];
 
 struct AudioMemory {
-	AudioPcmFrame capture[2][AUDIO_CAPTURE_FRAMES]
+	AudioPcmFrame capture[AUDIO_CAPTURE_BUFFER_COUNT][AUDIO_CAPTURE_FRAMES]
 		__attribute__((aligned(64)));
 	AudioPcmFrame ring[AUDIO_RING_FRAMES]
 		__attribute__((aligned(64)));
@@ -94,6 +136,28 @@ struct AudioUsbSlot {
 	unsigned int generation;
 };
 
+struct AudioDmaPeriod {
+	SceKernelDmaOpTag tag[2];
+} __attribute__((aligned(64)));
+
+/*
+ * VitaSDK's public declaration omits the fifth argument and declares a void
+ * return, while SceKernelDmacMgr 3.60 actually calls this ABI. Convert through
+ * a union when registering it so the implementation can validate the real
+ * byte count without an incompatible-function-pointer cast.
+ */
+typedef int (*AudioDmaOpCallbackAbi)(
+	SceKernelDmaOpId op_id,
+	SceUInt32 hardware_status,
+	void *user_data,
+	const SceKernelDmaOpTag *fault_tag,
+	SceUInt32 bytes_processed);
+
+union AudioDmaOpCallbackPointer {
+	AudioDmaOpCallbackAbi abi;
+	SceKernelDmaOpCallback sdk;
+};
+
 _Static_assert((AUDIO_RING_FRAMES & AUDIO_RING_MASK) == 0,
 	"audio ring size must be a power of two");
 _Static_assert(AUDIO_USB_QUEUE_DEPTH <= 32,
@@ -103,6 +167,17 @@ _Static_assert(AUDIO_USB_REQUEST_STRIDE >=
 	"audio USB request stride is too small");
 _Static_assert(UAC_NOMINAL_PACKET_FRAMES == UAC_MAX_PACKET_FRAMES,
 	"USB requests require fixed-size one-millisecond packets");
+_Static_assert(AUDIO_CAPTURE_INITIAL_QUEUE_DEPTH >= 2 &&
+	       AUDIO_CAPTURE_INITIAL_QUEUE_DEPTH < AUDIO_CAPTURE_BUFFER_COUNT,
+	"audio DMA needs queued headroom and at least one spare buffer");
+_Static_assert(AUDIO_CAPTURE_BUFFER_COUNT < 32,
+	"audio DMA buffer masks must fit in a signed 32-bit atomic");
+_Static_assert(sizeof(AudioPcmFrame) * AUDIO_CAPTURE_FRAMES >
+	       SRCMIX_AUX_DMAC_TAIL_BYTES,
+	"audio DMA period must contain a body and a 256-byte tail");
+_Static_assert((sizeof(AudioPcmFrame) * AUDIO_CAPTURE_FRAMES) %
+	       SRCMIX_AUX_DMAC_BLOCK_SIZE == 0,
+	"audio DMA period must be a multiple of the SourceMixer block size");
 
 static SceUdcdEndpoint *g_audio_endpoint;
 static SceUID g_audio_memory_uid = -1;
@@ -117,6 +192,16 @@ static SceUID g_capture_thread_id = -1;
 static SceUID g_usb_thread_id = -1;
 
 static struct AudioUsbSlot g_usb_slots[AUDIO_USB_QUEUE_DEPTH];
+static struct AudioDmaPeriod
+	g_capture_dma_period[AUDIO_CAPTURE_BUFFER_COUNT];
+static const SceKernelDmaOpChainParam g_capture_dma_chain_param = {
+	.size = sizeof(SceKernelDmaOpChainParam),
+	.coherencyMask = 0x0003FFFF,
+	.setValue = 0
+};
+
+static SceKernelDmaOpId g_capture_dma_op_id = -1;
+static volatile uint32_t *g_srcmix_aux_regs;
 
 static SceInt32 g_audio_initialized;
 static SceInt32 g_audio_exit;
@@ -128,59 +213,583 @@ static SceInt32 g_capture_stopped_generation;
 static SceInt32 g_usb_stopped_generation;
 static SceInt32 g_usb_in_flight;
 static SceInt32 g_usb_done_mask;
+static SceInt32 g_capture_dma_running;
+static SceInt32 g_capture_dma_done_mask;
+static SceInt32 g_capture_dma_free_mask;
+static SceInt32 g_capture_dma_error;
+static SceInt32 g_capture_dma_error_stage;
+static SceInt32 g_capture_dma_error_status;
+static SceInt32 g_capture_dma_error_bytes;
+static SceInt32 g_capture_dma_callback_period;
+
+#ifdef DIAGNOSTIC
+#define AUDIO_DIAGNOSTIC_CACHE_LINE_BYTES	32
+static unsigned char
+	g_capture_dma_previous[AUDIO_CAPTURE_BUFFER_COUNT]
+			      [AUDIO_CAPTURE_FRAMES * sizeof(AudioPcmFrame)]
+	__attribute__((aligned(64)));
+static unsigned int g_capture_dma_previous_valid_mask;
+static unsigned int g_capture_dma_lines_compared;
+static unsigned int g_capture_dma_lines_unchanged;
+static unsigned char
+	g_capture_dma_sentinel[AUDIO_CAPTURE_BUFFER_COUNT];
+static unsigned int g_capture_dma_sentinel_valid_mask;
+static unsigned int g_capture_dma_sentinel_sequence;
+static unsigned int g_capture_dma_sentinel_lines_tested;
+static unsigned int g_capture_dma_sentinel_lines_remaining;
+static unsigned int g_capture_dma_tag_mutation_count;
+static unsigned int g_capture_dma_callback_count;
+static unsigned int g_capture_dma_callback_busy_count;
+static unsigned int g_capture_dma_callback_sync_count;
+static unsigned int g_capture_dma_callback_status_or;
+#endif
 
 static uint32_t g_ring_read;
 static uint32_t g_ring_write;
 static int g_ring_rebuffering;
 
-static int audio_resolve_monitor_functions(void)
+static void audio_capture_dma_prepare_period(unsigned int period);
+static void audio_srcmix_barrier(void);
+#ifdef DIAGNOSTIC
+static int audio_capture_dma_period_tags_changed(unsigned int period);
+#endif
+
+static int audio_resolve_srcmix_aux(void)
 {
+	tai_module_info_t module_info;
+	volatile uint32_t *data;
+	uintptr_t data_address;
 	int ret;
 
-	if (g_audio_monitor_set_path_mode &&
-	    g_audio_monitor_set_sample_rate &&
-	    g_audio_monitor_set_channel_mode &&
-	    g_audio_monitor_read)
+	memset(&module_info, 0, sizeof(module_info));
+	module_info.size = sizeof(module_info);
+	ret = taiGetModuleInfoForKernel(KERNEL_PID, "SceAudio", &module_info);
+	diagnostic_record("resolve SceAudio module", ret);
+	if (ret < 0)
+		return ret;
+
+	ret = module_get_offset(KERNEL_PID, module_info.modid, 1, 0,
+				&data_address);
+	diagnostic_record("resolve SceAudio data segment", ret);
+	if (ret < 0)
+		return ret;
+	data = (volatile uint32_t *)data_address;
+
+	diagnostic_record("SceAudio SrcMix0 aux source",
+		data[SCE_AUDIO_SRCMIX0_AUX_SOURCE_OFFSET / sizeof(uint32_t)]);
+	diagnostic_record("SceAudio SrcMix0 aux destination",
+		data[SCE_AUDIO_SRCMIX0_AUX_DEST_OFFSET / sizeof(uint32_t)]);
+	diagnostic_record("SceAudio SrcMix0 aux command",
+		data[SCE_AUDIO_SRCMIX0_AUX_COMMAND_OFFSET / sizeof(uint32_t)]);
+	diagnostic_record("SceAudio SrcMix1 main source",
+		data[SCE_AUDIO_SRCMIX1_MAIN_SOURCE_OFFSET / sizeof(uint32_t)]);
+	diagnostic_record("SceAudio SrcMix1 main destination",
+		data[SCE_AUDIO_SRCMIX1_MAIN_DEST_OFFSET / sizeof(uint32_t)]);
+	diagnostic_record("SceAudio SrcMix1 main command",
+		data[SCE_AUDIO_SRCMIX1_MAIN_COMMAND_OFFSET / sizeof(uint32_t)]);
+	diagnostic_record("SceAudio SrcMix2 main source",
+		data[SCE_AUDIO_SRCMIX2_MAIN_SOURCE_OFFSET / sizeof(uint32_t)]);
+	diagnostic_record("SceAudio SrcMix2 main command",
+		data[SCE_AUDIO_SRCMIX2_MAIN_COMMAND_OFFSET / sizeof(uint32_t)]);
+
+	if (data[SCE_AUDIO_SRCMIX0_AUX_SOURCE_OFFSET / sizeof(uint32_t)] !=
+		    SCE_AUDIO_SRCMIX0_AUX_FIFO_PHYSICAL ||
+	    data[SCE_AUDIO_SRCMIX0_AUX_COMMAND_OFFSET / sizeof(uint32_t)] !=
+		    SCE_AUDIO_SRCMIX0_AUX_DMAC_COMMAND ||
+	    data[SCE_AUDIO_SRCMIX1_MAIN_SOURCE_OFFSET / sizeof(uint32_t)] !=
+		    SCE_AUDIO_SRCMIX1_MAIN_FIFO_PHYSICAL ||
+	    data[SCE_AUDIO_SRCMIX1_MAIN_COMMAND_OFFSET / sizeof(uint32_t)] !=
+		    SCE_AUDIO_SRCMIX1_MAIN_DMAC_COMMAND ||
+	    data[SCE_AUDIO_SRCMIX2_MAIN_SOURCE_OFFSET / sizeof(uint32_t)] !=
+		    SCE_AUDIO_SRCMIX2_MAIN_FIFO_PHYSICAL ||
+	    data[SCE_AUDIO_SRCMIX2_MAIN_COMMAND_OFFSET / sizeof(uint32_t)] !=
+		    SCE_AUDIO_SRCMIX2_MAIN_DMAC_COMMAND)
+		return SCE_UDCD_ERROR_INVALID_ARGUMENT;
+
+	g_srcmix_aux_regs = (volatile uint32_t *)(uintptr_t)
+		data[SCE_AUDIO_SRCMIX_REGS_POINTER_OFFSET / sizeof(uint32_t)];
+	diagnostic_record("SceAudio capture SrcMix mapping",
+			  (int)(uintptr_t)g_srcmix_aux_regs);
+	if (!g_srcmix_aux_regs || ((uintptr_t)g_srcmix_aux_regs & 3))
+		return SCE_UDCD_ERROR_INVALID_ARGUMENT;
+	diagnostic_record("SceAudio capture aux control",
+		(int)g_srcmix_aux_regs[SRCMIX_AUX_CONTROL_REGISTER]);
+	if (g_srcmix_aux_regs[SRCMIX_AUX_CONTROL_REGISTER] != 0)
+		return SCE_UDCD_ERROR_DRIVER_IN_PROGRESS;
+
+	return 0;
+}
+
+static void audio_capture_dma_fail(int stage, int failure,
+				   SceUInt32 bytes_processed)
+{
+	/*
+	 * Match SceAudio's callback stop path: stop the auxiliary producer
+	 * immediately, then let the worker dequeue and release the operation.
+	 */
+	if (g_srcmix_aux_regs) {
+		g_srcmix_aux_regs[SRCMIX_AUX_CONTROL_REGISTER] = 0;
+		audio_srcmix_barrier();
+	}
+	ksceKernelAtomicSet32(&g_capture_dma_error_stage, stage);
+	ksceKernelAtomicSet32(&g_capture_dma_error_status, failure);
+	ksceKernelAtomicSet32(&g_capture_dma_error_bytes,
+			     (SceInt32)bytes_processed);
+	ksceKernelAtomicSet32(&g_capture_dma_error, 1);
+	ksceKernelSetEventFlag(g_capture_event_id, AUDIO_THREAD_DMA);
+}
+
+static int audio_capture_dma_complete(SceKernelDmaOpId op_id,
+				      SceUInt32 hardware_status,
+				      void *user_data,
+				      const SceKernelDmaOpTag *fault_tag,
+				      SceUInt32 bytes_processed)
+{
+	SceKernelIntrStatus interrupt_state;
+	unsigned int period;
+	unsigned int next_period;
+	unsigned int append_period;
+	unsigned int append_mask;
+	int ret;
+
+	(void)user_data;
+	(void)fault_tag;
+
+	if (!ksceKernelAtomicGetAndAdd32(&g_capture_dma_running, 0))
 		return 0;
 
-	ret = module_get_export_func(KERNEL_PID, "SceAudio",
-		SCE_AUDIO_FOR_DRIVER_NID,
-		SCE_AUDIO_MONITOR_SET_PATH_MODE_NID,
-		(uintptr_t *)&g_audio_monitor_set_path_mode);
-	diagnostic_record("resolve SceAudio monitor path mode", ret);
+#ifdef DIAGNOSTIC
+	g_capture_dma_callback_count++;
+	g_capture_dma_callback_status_or |= hardware_status;
+	if (hardware_status & SCE_KERNEL_DMAC_STAT_BUSY)
+		g_capture_dma_callback_busy_count++;
+#endif
+
+	if ((hardware_status & SRCMIX_AUX_DMAC_ERROR_MASK) ||
+	    bytes_processed !=
+		    sizeof(g_audio_memory->capture[0])) {
+		audio_capture_dma_fail(
+			1, (SceInt32)hardware_status, bytes_processed);
+		return 0;
+	}
+
+	/*
+	 * DmacMgr guarantees callbacks in channel order, but its normal
+	 * completion interrupt can pass a null/stale fault_tag. Hardware
+	 * status bit 0 is the callback-time DMAC BUSY snapshot. SceAudio accepts
+	 * it as sufficient liveness evidence and polls only when it is clear.
+	 * Track the bounded queue position explicitly instead of relying on the
+	 * callback's fault_tag.
+	 */
+	period = (unsigned int)ksceKernelAtomicGetAndAdd32(
+		&g_capture_dma_callback_period, 0);
+	next_period = period + 1;
+	if (next_period == AUDIO_CAPTURE_BUFFER_COUNT)
+		next_period = 0;
+	ksceKernelAtomicSet32(&g_capture_dma_callback_period,
+			     (SceInt32)next_period);
+
+	/*
+	 * Keep the peripheral chain alive from callback context, as SceAudio
+	 * does. Deferring Concatenate to a worker allows the operation to drain;
+	 * a later successful append then does not restart the hardware stream.
+	 *
+	 * Do not immediately requeue the completed destination. Two periods stay
+	 * in the hardware queue while six remain in a worker-owned reserve. The
+	 * callback appends the next period in sequence only after the worker has
+	 * copied and released it. Exhausting that reserve stops the producer
+	 * before DMAC4 can overwrite unread PCM.
+	 */
+	append_period = period + AUDIO_CAPTURE_INITIAL_QUEUE_DEPTH;
+	if (append_period >= AUDIO_CAPTURE_BUFFER_COUNT)
+		append_period -= AUDIO_CAPTURE_BUFFER_COUNT;
+	append_mask = 1u << append_period;
+	ret = ksceKernelAtomicGetAndClear32(
+		&g_capture_dma_free_mask, (SceInt32)append_mask);
+	if (!(ret & append_mask)) {
+		audio_capture_dma_fail(4, ret, bytes_processed);
+		return 0;
+	}
+
+#ifdef DIAGNOSTIC
+	if (audio_capture_dma_period_tags_changed(append_period))
+		g_capture_dma_tag_mutation_count++;
+#endif
+	audio_capture_dma_prepare_period(append_period);
+	interrupt_state = ksceKernelCpuSuspendIntr();
+	if (!(hardware_status & SCE_KERNEL_DMAC_STAT_BUSY)) {
+#ifdef DIAGNOSTIC
+		g_capture_dma_callback_sync_count++;
+#endif
+		ret = ksceKernelDmaOpSync(
+			op_id, SCE_KERNEL_DMA_OP_SYNC_POLL, NULL, NULL);
+		if (ret <= 0) {
+			(void)ksceKernelCpuResumeIntr(interrupt_state);
+			audio_capture_dma_fail(2, ret, bytes_processed);
+			return 0;
+		}
+	}
+	ret = ksceKernelDmaOpConcatenate(
+		op_id,
+		g_capture_dma_period[append_period].tag,
+		SCE_KERNEL_DMA_OP_VIRTUAL_DST_ADDR);
+	(void)ksceKernelCpuResumeIntr(interrupt_state);
+	if (ret < 0) {
+		audio_capture_dma_fail(3, ret, bytes_processed);
+		return 0;
+	}
+
+	ret = ksceKernelAtomicGetAndOr32(&g_capture_dma_done_mask,
+					1u << period);
+	if (ret & (1u << period)) {
+		audio_capture_dma_fail(5, ret, bytes_processed);
+		return 0;
+	}
+
+	ksceKernelSetEventFlag(g_capture_event_id, AUDIO_THREAD_DMA);
+	return 0;
+}
+
+static void audio_capture_dma_prepare_period(unsigned int period)
+{
+	const unsigned int period_bytes =
+		sizeof(g_audio_memory->capture[period]);
+	/*
+	 * AudioMemory uses KERNEL_ROOT_NC_RW. SceAudio adds COHERENT_DST only
+	 * for cached monitor destinations; applying it to this non-cacheable
+	 * alias produces incomplete destination writes on DMAC4.
+	 */
+	const unsigned int command = SRCMIX_AUX_DMAC_COMMAND;
+	unsigned char *destination =
+		(unsigned char *)g_audio_memory->capture[period];
+	SceKernelDmaOpTag *tag = g_capture_dma_period[period].tag;
+
+	tag[0] = (SceKernelDmaOpTag){
+		.src = SRCMIX_AUX_FIFO_PHYSICAL,
+		.dst = destination,
+		.len = SRCMIX_AUX_DMAC_DIRECTION |
+		       (period_bytes - SRCMIX_AUX_DMAC_TAIL_BYTES),
+		.cmd = command,
+		.keyring = 0,
+		.iv = NULL,
+		.blockSize = SRCMIX_AUX_DMAC_BLOCK_SIZE,
+		.pNext = &tag[1]
+	};
+	tag[1] = (SceKernelDmaOpTag){
+		.src = SRCMIX_AUX_FIFO_PHYSICAL,
+		.dst = destination + period_bytes -
+		       SRCMIX_AUX_DMAC_TAIL_BYTES,
+		.len = SRCMIX_AUX_DMAC_DIRECTION |
+		       SRCMIX_AUX_DMAC_TAIL_BYTES,
+		.cmd = command | SRCMIX_AUX_DMAC_COMPLETION,
+		.keyring = 0,
+		.iv = NULL,
+		.blockSize = SRCMIX_AUX_DMAC_BLOCK_SIZE,
+		.pNext = SCE_KERNEL_DMAC_CHAIN_END
+	};
+}
+
+#ifdef DIAGNOSTIC
+static int audio_capture_dma_period_tags_changed(unsigned int period)
+{
+	const unsigned int period_bytes =
+		sizeof(g_audio_memory->capture[period]);
+	const unsigned int command = SRCMIX_AUX_DMAC_COMMAND;
+	const unsigned char *destination =
+		(const unsigned char *)g_audio_memory->capture[period];
+	const SceKernelDmaOpTag *tag =
+		g_capture_dma_period[period].tag;
+
+	return tag[0].src != SRCMIX_AUX_FIFO_PHYSICAL ||
+	       tag[0].dst != destination ||
+	       tag[0].len !=
+		       (SRCMIX_AUX_DMAC_DIRECTION |
+			(period_bytes - SRCMIX_AUX_DMAC_TAIL_BYTES)) ||
+	       tag[0].cmd != command ||
+	       tag[0].keyring != 0 ||
+	       tag[0].iv != NULL ||
+	       tag[0].blockSize != SRCMIX_AUX_DMAC_BLOCK_SIZE ||
+	       tag[0].pNext != &g_capture_dma_period[period].tag[1] ||
+	       tag[1].src != SRCMIX_AUX_FIFO_PHYSICAL ||
+	       tag[1].dst !=
+		       destination + period_bytes -
+			       SRCMIX_AUX_DMAC_TAIL_BYTES ||
+	       tag[1].len !=
+		       (SRCMIX_AUX_DMAC_DIRECTION |
+			SRCMIX_AUX_DMAC_TAIL_BYTES) ||
+	       tag[1].cmd != (command | SRCMIX_AUX_DMAC_COMPLETION) ||
+	       tag[1].keyring != 0 ||
+	       tag[1].iv != NULL ||
+	       tag[1].blockSize != SRCMIX_AUX_DMAC_BLOCK_SIZE ||
+	       tag[1].pNext != SCE_KERNEL_DMAC_CHAIN_END;
+}
+
+static void audio_capture_dma_measure_visibility(unsigned int period)
+{
+	const unsigned char *current =
+		(const unsigned char *)g_audio_memory->capture[period];
+	unsigned int offset;
+
+	if (g_capture_dma_previous_valid_mask & (1u << period)) {
+		for (offset = 0;
+		     offset < sizeof(g_audio_memory->capture[period]);
+		     offset += AUDIO_DIAGNOSTIC_CACHE_LINE_BYTES) {
+			g_capture_dma_lines_compared++;
+			if (memcmp(&current[offset],
+				   &g_capture_dma_previous[period][offset],
+				   AUDIO_DIAGNOSTIC_CACHE_LINE_BYTES) == 0)
+				g_capture_dma_lines_unchanged++;
+		}
+	} else {
+		g_capture_dma_previous_valid_mask |= 1u << period;
+	}
+
+	memcpy(g_capture_dma_previous[period], current,
+	       sizeof(g_audio_memory->capture[period]));
+}
+
+static unsigned int
+audio_capture_dma_measure_sentinel(unsigned int period)
+{
+	const unsigned char *current =
+		(const unsigned char *)g_audio_memory->capture[period];
+	const unsigned char sentinel = g_capture_dma_sentinel[period];
+	unsigned int lines_remaining = 0;
+	unsigned int offset;
+
+	if (!(g_capture_dma_sentinel_valid_mask & (1u << period)))
+		return 0;
+
+	for (offset = 0;
+	     offset < sizeof(g_audio_memory->capture[period]);
+	     offset += AUDIO_DIAGNOSTIC_CACHE_LINE_BYTES) {
+		unsigned int byte;
+
+		g_capture_dma_sentinel_lines_tested++;
+		for (byte = 0; byte < AUDIO_DIAGNOSTIC_CACHE_LINE_BYTES; byte++) {
+			if (current[offset + byte] != sentinel)
+				break;
+		}
+		if (byte == AUDIO_DIAGNOSTIC_CACHE_LINE_BYTES) {
+			lines_remaining++;
+			g_capture_dma_sentinel_lines_remaining++;
+		}
+	}
+
+	return lines_remaining;
+}
+
+static void audio_capture_dma_prime_sentinel(unsigned int period)
+{
+	unsigned char sentinel =
+		(unsigned char)(0x80 | (g_capture_dma_sentinel_sequence & 0x3F));
+
+	g_capture_dma_sentinel_sequence++;
+	g_capture_dma_sentinel[period] = sentinel;
+	g_capture_dma_sentinel_valid_mask |= 1u << period;
+	memset(g_audio_memory->capture[period], sentinel,
+	       sizeof(g_audio_memory->capture[period]));
+}
+#endif
+
+static int audio_capture_dma_init(void)
+{
+	union AudioDmaOpCallbackPointer callback = {
+		.abi = audio_capture_dma_complete
+	};
+	int ret;
+
+	g_capture_dma_op_id = ksceKernelDmaOpAlloc("uac_srcmix1_aux");
+	diagnostic_record("allocate SrcMix1 aux DMA", g_capture_dma_op_id);
+	if (g_capture_dma_op_id < 0)
+		return g_capture_dma_op_id;
+
+	ret = ksceKernelDmaOpSetCallback(g_capture_dma_op_id,
+					callback.sdk, NULL);
+	diagnostic_record("set SrcMix1 aux DMA callback", ret);
 	if (ret < 0)
 		goto fail;
 
-	ret = module_get_export_func(KERNEL_PID, "SceAudio",
-		SCE_AUDIO_FOR_DRIVER_NID, SCE_AUDIO_MONITOR_SET_RATE_NID,
-		(uintptr_t *)&g_audio_monitor_set_sample_rate);
-	diagnostic_record("resolve SceAudio monitor rate", ret);
+	ret = ksceKernelDmaOpAssign(g_capture_dma_op_id,
+				   SCE_KERNEL_DMAC_ID_DMAC4,
+				   SRCMIX_AUX_DMAC_CHANNEL);
+	diagnostic_record("assign SrcMix1 aux DMA channel", ret);
 	if (ret < 0)
 		goto fail;
 
-	ret = module_get_export_func(KERNEL_PID, "SceAudio",
-		SCE_AUDIO_FOR_DRIVER_NID,
-		SCE_AUDIO_MONITOR_SET_CHANNEL_MODE_NID,
-		(uintptr_t *)&g_audio_monitor_set_channel_mode);
-	diagnostic_record("resolve SceAudio monitor channel mode", ret);
-	if (ret < 0)
-		goto fail;
-
-	ret = module_get_export_func(KERNEL_PID, "SceAudio",
-		SCE_AUDIO_FOR_DRIVER_NID, SCE_AUDIO_MONITOR_READ_NID,
-		(uintptr_t *)&g_audio_monitor_read);
-	diagnostic_record("resolve SceAudio monitor read", ret);
-	if (ret < 0)
-		goto fail;
-
+	ksceKernelAtomicSet32(&g_capture_dma_running, 0);
+	ksceKernelAtomicSet32(&g_capture_dma_done_mask, 0);
+	ksceKernelAtomicSet32(&g_capture_dma_free_mask, 0);
+	ksceKernelAtomicSet32(&g_capture_dma_error, 0);
+	ksceKernelAtomicSet32(&g_capture_dma_error_stage, 0);
+	ksceKernelAtomicSet32(&g_capture_dma_error_status, 0);
+	ksceKernelAtomicSet32(&g_capture_dma_error_bytes, 0);
+	ksceKernelAtomicSet32(&g_capture_dma_callback_period, 0);
 	return 0;
 
 fail:
-	g_audio_monitor_set_path_mode = NULL;
-	g_audio_monitor_set_sample_rate = NULL;
-	g_audio_monitor_set_channel_mode = NULL;
-	g_audio_monitor_read = NULL;
+	(void)ksceKernelDmaOpFree(g_capture_dma_op_id);
+	g_capture_dma_op_id = -1;
 	return ret;
+}
+
+static int audio_capture_dma_term(void)
+{
+	int ret;
+
+	if (g_capture_dma_op_id < 0)
+		return 0;
+	if (ksceKernelAtomicGetAndAdd32(&g_capture_dma_running, 0))
+		return SCE_UDCD_ERROR_DRIVER_IN_PROGRESS;
+
+	ret = ksceKernelDmaOpFree(g_capture_dma_op_id);
+	diagnostic_record("free SrcMix1 aux DMA", ret);
+	if (ret < 0)
+		return ret;
+
+	g_capture_dma_op_id = -1;
+	g_srcmix_aux_regs = NULL;
+	return 0;
+}
+
+static void audio_srcmix_barrier(void)
+{
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+static int audio_capture_dma_start(void)
+{
+	unsigned int period;
+	unsigned int ignored;
+	int setup_done = 0;
+	int ret;
+
+	if (!g_srcmix_aux_regs || g_capture_dma_op_id < 0)
+		return SCE_UDCD_ERROR_INVALID_ARGUMENT;
+	if (g_srcmix_aux_regs[SRCMIX_AUX_CONTROL_REGISTER] != 0)
+		return SCE_UDCD_ERROR_DRIVER_IN_PROGRESS;
+
+	g_srcmix_aux_regs[SRCMIX_AUX_CONTROL_REGISTER] = 0;
+	audio_srcmix_barrier();
+
+	ksceKernelAtomicSet32(&g_capture_dma_done_mask, 0);
+	ksceKernelAtomicSet32(
+		&g_capture_dma_free_mask,
+		(SceInt32)(AUDIO_CAPTURE_BUFFER_MASK &
+			~((1u << AUDIO_CAPTURE_INITIAL_QUEUE_DEPTH) - 1)));
+	ksceKernelAtomicSet32(&g_capture_dma_error, 0);
+	ksceKernelAtomicSet32(&g_capture_dma_error_stage, 0);
+	ksceKernelAtomicSet32(&g_capture_dma_error_status, 0);
+	ksceKernelAtomicSet32(&g_capture_dma_error_bytes, 0);
+	ksceKernelAtomicSet32(&g_capture_dma_callback_period, 0);
+#ifdef DIAGNOSTIC
+	g_capture_dma_previous_valid_mask = 0;
+	g_capture_dma_lines_compared = 0;
+	g_capture_dma_lines_unchanged = 0;
+	g_capture_dma_sentinel_valid_mask = 0;
+	g_capture_dma_sentinel_sequence = 0;
+	g_capture_dma_sentinel_lines_tested = 0;
+	g_capture_dma_sentinel_lines_remaining = 0;
+	g_capture_dma_tag_mutation_count = 0;
+	g_capture_dma_callback_count = 0;
+	g_capture_dma_callback_busy_count = 0;
+	g_capture_dma_callback_sync_count = 0;
+	g_capture_dma_callback_status_or = 0;
+#endif
+	(void)ksceKernelPollEventFlag(g_capture_event_id, AUDIO_THREAD_DMA,
+		SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR_PAT, &ignored);
+
+	for (period = 0; period < AUDIO_CAPTURE_BUFFER_COUNT; period++) {
+		audio_capture_dma_prepare_period(period);
+#ifdef DIAGNOSTIC
+		audio_capture_dma_prime_sentinel(period);
+#endif
+	}
+
+	ret = ksceKernelDmaOpSetupChain(g_capture_dma_op_id,
+		g_capture_dma_period[0].tag,
+		(SceKernelDmaOpChainParam *)&g_capture_dma_chain_param,
+		SCE_KERNEL_DMA_OP_VIRTUAL_DST_ADDR);
+	diagnostic_record("setup SrcMix1 aux DMA", ret);
+	if (ret < 0)
+		return ret;
+	setup_done = 1;
+
+	for (period = 1;
+	     period < AUDIO_CAPTURE_INITIAL_QUEUE_DEPTH;
+	     period++) {
+		ret = ksceKernelDmaOpConcatenate(g_capture_dma_op_id,
+			g_capture_dma_period[period].tag,
+			SCE_KERNEL_DMA_OP_VIRTUAL_DST_ADDR);
+		diagnostic_record("append SrcMix1 aux DMA period", ret);
+		if (ret < 0)
+			goto fail;
+	}
+
+	ksceKernelAtomicSet32(&g_capture_dma_running, 1);
+	ret = ksceKernelDmaOpEnQueue(g_capture_dma_op_id);
+	diagnostic_record("enqueue SrcMix1 aux DMA", ret);
+	if (ret < 0) {
+		ksceKernelAtomicSet32(&g_capture_dma_running, 0);
+		goto fail;
+	}
+
+	g_srcmix_aux_regs[SRCMIX_AUX_CONTROL_REGISTER] = SRCMIX_AUX_ENABLE;
+	audio_srcmix_barrier();
+	return 0;
+
+fail:
+	if (setup_done) {
+		int quit_ret = ksceKernelDmaOpQuit(g_capture_dma_op_id);
+		diagnostic_record("quit failed SrcMix1 aux start", quit_ret);
+		if (quit_ret < 0)
+			return quit_ret;
+	}
+	return ret;
+}
+
+static int audio_capture_dma_stop(void)
+{
+	unsigned int ignored;
+	int dequeue_ret;
+	int quit_ret;
+	int was_running;
+
+	was_running = ksceKernelAtomicGetAndSet32(&g_capture_dma_running, 0);
+	if (g_srcmix_aux_regs) {
+		g_srcmix_aux_regs[SRCMIX_AUX_CONTROL_REGISTER] = 0;
+		audio_srcmix_barrier();
+	}
+	if (!was_running)
+		return 0;
+
+	/*
+	 * Quit releases the operation's tags but does not unlink an operation
+	 * which is queued behind another client on the same physical channel.
+	 * Remove that queue node first; NOT_QUEUED and ON_TRANSFERRING are the
+	 * two expected races with normal DMAC4 progress.
+	 */
+	dequeue_ret = ksceKernelDmaOpDeQueue(g_capture_dma_op_id);
+	diagnostic_record("dequeue SrcMix1 aux DMA", dequeue_ret);
+
+	quit_ret = ksceKernelDmaOpQuit(g_capture_dma_op_id);
+	diagnostic_record("quit SrcMix1 aux DMA", quit_ret);
+	if (quit_ret < 0)
+		return quit_ret;
+	if (dequeue_ret < 0 &&
+	    dequeue_ret != SCE_KERNEL_ERROR_NOT_QUEUED &&
+	    dequeue_ret != SCE_KERNEL_ERROR_ON_TRANSFERRING)
+		return dequeue_ret;
+
+	ksceKernelAtomicSet32(&g_capture_dma_done_mask, 0);
+	ksceKernelAtomicSet32(&g_capture_dma_free_mask, 0);
+	ksceKernelAtomicSet32(&g_capture_dma_error, 0);
+	ksceKernelAtomicSet32(&g_capture_dma_error_stage, 0);
+	ksceKernelAtomicSet32(&g_capture_dma_error_status, 0);
+	ksceKernelAtomicSet32(&g_capture_dma_error_bytes, 0);
+	(void)ksceKernelPollEventFlag(g_capture_event_id, AUDIO_THREAD_DMA,
+		SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR_PAT, &ignored);
+	return 0;
 }
 
 static void audio_ring_reset(void)
@@ -466,11 +1075,11 @@ static void audio_capture_mark_stopped(void)
 	int generation;
 
 	/*
-	 * The stop wake may still be pending after monitor_read(NULL) drains the
-	 * last destination. Clear it before publishing stopped so it cannot
-	 * produce a second, stale acknowledgement in the next generation.
+	 * A final DMA completion may race the stop wake. Clear both notifications
+	 * before publishing stopped so neither can leak into the next generation.
 	 */
-	(void)ksceKernelPollEventFlag(g_capture_event_id, AUDIO_THREAD_WAKE,
+	(void)ksceKernelPollEventFlag(g_capture_event_id,
+		AUDIO_THREAD_WAKE | AUDIO_THREAD_DMA,
 		SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR_PAT, &ignored);
 
 	generation = ksceKernelAtomicGetAndAdd32(&g_audio_generation, 0);
@@ -483,80 +1092,141 @@ static void audio_capture_mark_stopped(void)
 
 static int audio_capture_run(unsigned int generation)
 {
-	unsigned int current = 0;
+	unsigned int expected_period = 0;
 	int ret;
 
-	ksceKernelDcacheInvalidateRange(
-		g_audio_memory->capture[current],
-		sizeof(g_audio_memory->capture[current]));
-	ret = g_audio_monitor_read(AUDIO_MONITOR_PATH,
-		g_audio_memory->capture[current], AUDIO_CAPTURE_FRAMES);
-	diagnostic_record("initial audio monitor read", ret);
+	ret = audio_capture_dma_start();
+	diagnostic_record("start SrcMix1 aux capture", ret);
 	if (ret < 0) {
-		int mode_ret = g_audio_monitor_set_path_mode(
-			AUDIO_MONITOR_PATH, AUDIO_MONITOR_MODE_DISABLED);
-		diagnostic_record("disable audio monitor path", mode_ret);
 		audio_signal_failure();
-		/*
-		 * A failed initial queue did not transfer ownership of a capture
-		 * buffer, so it is safe for the worker to acknowledge the stop.
-		 */
 		return 0;
 	}
 
 	while (ksceKernelAtomicGetAndAdd32(&g_audio_desired, 0) &&
 	       generation == (unsigned int)ksceKernelAtomicGetAndAdd32(
 		       &g_audio_generation, 0)) {
-		unsigned int next = current ^ 1;
+		unsigned int done_mask;
+		unsigned int out_bits;
+		SceUInt timeout = AUDIO_DMA_TIMEOUT_US;
+		int dma_error;
 
-		ksceKernelDcacheInvalidateRange(
-			g_audio_memory->capture[next],
-			sizeof(g_audio_memory->capture[next]));
-		ret = g_audio_monitor_read(AUDIO_MONITOR_PATH,
-			g_audio_memory->capture[next], AUDIO_CAPTURE_FRAMES);
+		ret = ksceKernelWaitEventFlag(g_capture_event_id,
+			AUDIO_THREAD_WAKE | AUDIO_THREAD_DMA,
+			SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR_PAT,
+			&out_bits, &timeout);
 		if (ret < 0) {
+			diagnostic_record("SrcMix1 aux DMA wait timeout", ret);
 			audio_signal_failure();
 			break;
 		}
 
-		ksceKernelDcacheInvalidateRange(
-			g_audio_memory->capture[current],
-			sizeof(g_audio_memory->capture[current]));
-
-		if (ksceKernelAtomicGetAndAdd32(&g_audio_desired, 0) &&
-		    generation == (unsigned int)ksceKernelAtomicGetAndAdd32(
+		if (!ksceKernelAtomicGetAndAdd32(&g_audio_desired, 0) ||
+		    generation != (unsigned int)ksceKernelAtomicGetAndAdd32(
 			    &g_audio_generation, 0))
-			audio_ring_push(g_audio_memory->capture[current],
-					AUDIO_CAPTURE_FRAMES);
-		current = next;
+			break;
+
+		dma_error =
+			ksceKernelAtomicGetAndSet32(&g_capture_dma_error, 0);
+		if (dma_error) {
+			diagnostic_record("SrcMix1 aux DMA error stage",
+				ksceKernelAtomicGetAndAdd32(
+					&g_capture_dma_error_stage, 0));
+			diagnostic_record("SrcMix1 aux DMA error status",
+				ksceKernelAtomicGetAndAdd32(
+					&g_capture_dma_error_status, 0));
+			diagnostic_record("SrcMix1 aux DMA error bytes",
+				ksceKernelAtomicGetAndAdd32(
+					&g_capture_dma_error_bytes, 0));
+			audio_signal_failure();
+			break;
+		}
+
+		done_mask = (unsigned int)ksceKernelAtomicGetAndSet32(
+			&g_capture_dma_done_mask, 0);
+		while (done_mask) {
+			unsigned int expected_mask = 1u << expected_period;
+#ifdef DIAGNOSTIC
+			unsigned int sentinel_lines_remaining;
+#endif
+
+			/*
+			 * DMAC4 completes the bounded period queue in order.
+			 * Rejecting any other order avoids silently shuffling PCM
+			 * if a future DmacMgr changes callback-tag semantics.
+			 */
+			if (!(done_mask & expected_mask)) {
+				diagnostic_record(
+					"SrcMix1 aux DMA period order",
+					(int)done_mask);
+				audio_signal_failure();
+				break;
+			}
+			done_mask &= ~expected_mask;
+
+#ifdef DIAGNOSTIC
+			sentinel_lines_remaining =
+				audio_capture_dma_measure_sentinel(expected_period);
+			audio_capture_dma_measure_visibility(expected_period);
+#endif
+#ifdef DIAGNOSTIC
+			if (!sentinel_lines_remaining)
+#endif
+			audio_ring_push(
+				g_audio_memory->capture[expected_period],
+				AUDIO_CAPTURE_FRAMES);
+
+			ret = ksceKernelAtomicGetAndOr32(
+				&g_capture_dma_free_mask,
+				(SceInt32)expected_mask);
+			if (ret & expected_mask) {
+				audio_capture_dma_fail(
+					6, ret,
+					sizeof(g_audio_memory
+						       ->capture[expected_period]));
+				audio_signal_failure();
+				break;
+			}
+
+			if (!ksceKernelAtomicGetAndAdd32(
+				    &g_audio_desired, 0) ||
+			    generation !=
+				    (unsigned int)ksceKernelAtomicGetAndAdd32(
+					    &g_audio_generation, 0))
+				break;
+
+			expected_period++;
+			if (expected_period == AUDIO_CAPTURE_BUFFER_COUNT)
+				expected_period = 0;
+		}
 	}
 
-	/*
-	 * Wait for the last queued monitor destination to be released, without
-	 * queueing another destination. This is required before reuse or unload.
-	 */
-	ret = g_audio_monitor_read(AUDIO_MONITOR_PATH, NULL,
-				   AUDIO_CAPTURE_FRAMES);
+	ret = audio_capture_dma_stop();
 	if (ret < 0) {
-		int mode_ret = g_audio_monitor_set_path_mode(
-			AUDIO_MONITOR_PATH, AUDIO_MONITOR_MODE_DISABLED);
-		diagnostic_record("disable unsafe audio monitor path",
-				  mode_ret);
-		/*
-		 * Do not advertise the capture memory as safe when the final
-		 * ownership fence fails. The stop timeout will prevent unload.
-		 */
 		ksceKernelAtomicSet32(&g_capture_unsafe, 1);
 		audio_signal_failure();
 		return ret;
 	}
 
-	ret = g_audio_monitor_set_path_mode(
-		AUDIO_MONITOR_PATH, AUDIO_MONITOR_MODE_DISABLED);
-	diagnostic_record("disable audio monitor path", ret);
-	if (ret < 0)
-		return ret;
-
+#ifdef DIAGNOSTIC
+	diagnostic_record("SrcMix1 DMA cache lines compared",
+			  (int)g_capture_dma_lines_compared);
+	diagnostic_record("SrcMix1 DMA cache lines unchanged",
+			  (int)g_capture_dma_lines_unchanged);
+	diagnostic_record("SrcMix1 DMA sentinel lines tested",
+			  (int)g_capture_dma_sentinel_lines_tested);
+	diagnostic_record("SrcMix1 DMA sentinel lines remaining",
+			  (int)g_capture_dma_sentinel_lines_remaining);
+	diagnostic_record("SrcMix1 DMA tag mutations",
+			  (int)g_capture_dma_tag_mutation_count);
+	diagnostic_record("SrcMix1 DMA callback count",
+			  (int)g_capture_dma_callback_count);
+	diagnostic_record("SrcMix1 DMA busy callbacks",
+			  (int)g_capture_dma_callback_busy_count);
+	diagnostic_record("SrcMix1 DMA sync callbacks",
+			  (int)g_capture_dma_callback_sync_count);
+	diagnostic_record("SrcMix1 DMA callback status OR",
+			  (int)g_capture_dma_callback_status_or);
+#endif
 	ksceKernelAtomicSet32(&g_capture_unsafe, 0);
 	return 0;
 }
@@ -653,7 +1323,8 @@ static void audio_discard_stale_worker_events(void)
 	 * caller can acknowledge stopped before consuming that self-wake. Drain
 	 * such completed-generation notifications before publishing a new one.
 	 */
-	(void)ksceKernelPollEventFlag(g_capture_event_id, AUDIO_THREAD_WAKE,
+	(void)ksceKernelPollEventFlag(g_capture_event_id,
+		AUDIO_THREAD_WAKE | AUDIO_THREAD_DMA,
 		SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR_PAT, &ignored);
 	(void)ksceKernelPollEventFlag(g_usb_event_id,
 		AUDIO_THREAD_WAKE | AUDIO_THREAD_DONE,
@@ -678,7 +1349,8 @@ int uac_audio_init(SceUdcdEndpoint *endpoint)
 	opt.alignment = 4096;
 
 	g_audio_memory_uid = ksceKernelAllocMemBlock("uac_audio_memory",
-		0x10208006, memory_size, &opt);
+		SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_ROOT_NC_RW,
+		memory_size, &opt);
 	if (g_audio_memory_uid < 0)
 		return g_audio_memory_uid;
 
@@ -719,15 +1391,21 @@ int uac_audio_init(SceUdcdEndpoint *endpoint)
 		goto fail_usb_event;
 	}
 
+	ret = audio_capture_dma_init();
+	if (ret < 0)
+		goto fail_state_event;
+
 	g_capture_thread_id = ksceKernelCreateThread("uac_capture_thread",
-		audio_capture_thread, 0x3A, 0x2000, 0, 0x10000, NULL);
+		audio_capture_thread, 0x3A, 0x2000, 0,
+		AUDIO_CAPTURE_CPU_AFFINITY, NULL);
 	if (g_capture_thread_id < 0) {
 		ret = g_capture_thread_id;
-		goto fail_state_event;
+		goto fail_capture_dma;
 	}
 
 	g_usb_thread_id = ksceKernelCreateThread("uac_usb_thread",
-		audio_usb_thread, 0x38, 0x2000, 0, 0x10000, NULL);
+		audio_usb_thread, 0x38, 0x2000, 0,
+		AUDIO_USB_CPU_AFFINITY, NULL);
 	if (g_usb_thread_id < 0) {
 		ret = g_usb_thread_id;
 		goto fail_capture_thread;
@@ -766,6 +1444,8 @@ fail_usb_thread:
 fail_capture_thread:
 	ksceKernelDeleteThread(g_capture_thread_id);
 	g_capture_thread_id = -1;
+fail_capture_dma:
+	(void)audio_capture_dma_term();
 fail_state_event:
 	ksceKernelDeleteEventFlag(g_state_event_id);
 	g_state_event_id = -1;
@@ -805,35 +1485,15 @@ int uac_audio_start(void)
 		goto out;
 	}
 
-	ret = audio_resolve_monitor_functions();
-	if (ret < 0)
-		goto out;
-
-	/*
-	 * The rate/channel setters only select the monitor format. SceAudio's
-	 * path must separately be placed in readback mode; otherwise the first
-	 * monitor read returns -2 and no capture DMA is started.
-	 */
-	ret = g_audio_monitor_set_path_mode(
-		AUDIO_MONITOR_PATH, AUDIO_MONITOR_MODE_READBACK);
-	diagnostic_record("enable audio monitor path", ret);
-	if (ret < 0)
-		goto out;
-
 	audio_request_stop_locked();
 	ret = audio_wait_stopped(
 		ksceKernelAtomicGetAndAdd32(&g_audio_generation, 0));
 	if (ret < 0)
-		goto disable_monitor_path;
+		goto out;
 
-	ret = g_audio_monitor_set_sample_rate(UAC_SAMPLE_RATE);
-	diagnostic_record("set audio monitor rate", ret);
+	ret = audio_resolve_srcmix_aux();
 	if (ret < 0)
-		goto disable_monitor_path;
-	ret = g_audio_monitor_set_channel_mode(AUDIO_MONITOR_STEREO);
-	diagnostic_record("set audio monitor channel mode", ret);
-	if (ret < 0)
-		goto disable_monitor_path;
+		goto out;
 
 	/* Discard any already-consumed generation's notification bits. */
 	audio_discard_stale_worker_events();
@@ -846,11 +1506,6 @@ int uac_audio_start(void)
 	ksceKernelSetEventFlag(g_capture_event_id, AUDIO_THREAD_WAKE);
 	ksceKernelSetEventFlag(g_usb_event_id, AUDIO_THREAD_WAKE);
 	ret = 0;
-	goto out;
-
-disable_monitor_path:
-	(void)g_audio_monitor_set_path_mode(
-		AUDIO_MONITOR_PATH, AUDIO_MONITOR_MODE_DISABLED);
 out:
 	ksceKernelUnlockFastMutex(&g_audio_state_mutex);
 	return ret;
@@ -933,6 +1588,9 @@ int uac_audio_term(void)
 
 	ksceKernelDeleteThread(g_capture_thread_id);
 	ksceKernelDeleteThread(g_usb_thread_id);
+	ret = audio_capture_dma_term();
+	if (ret < 0)
+		return ret;
 	ksceKernelDeleteEventFlag(g_capture_event_id);
 	ksceKernelDeleteEventFlag(g_usb_event_id);
 	ksceKernelDeleteEventFlag(g_state_event_id);
