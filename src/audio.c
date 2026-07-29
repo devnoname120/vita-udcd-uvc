@@ -23,10 +23,19 @@
 #define AUDIO_RING_FRAMES			8192
 #define AUDIO_RING_MASK				(AUDIO_RING_FRAMES - 1)
 #define AUDIO_RING_TARGET_FRAMES		1024
-#define AUDIO_RING_DRIFT_THRESHOLD		128
 
+/*
+ * Keep the UAC wire cadence at one 192-byte packet per millisecond, but give
+ * SceUdcd four packets per request. The controller splits each request at the
+ * endpoint's wMaxPacketSize, reducing completion/requeue work without changing
+ * the host-visible 48 kHz stereo format.
+ */
 #define AUDIO_USB_QUEUE_DEPTH			32
-#define AUDIO_USB_PACKET_STRIDE			224
+#define AUDIO_USB_REQUEST_INTERVALS		4
+#define AUDIO_USB_REQUEST_FRAMES		\
+	(UAC_NOMINAL_PACKET_FRAMES * AUDIO_USB_REQUEST_INTERVALS)
+#define AUDIO_USB_REQUEST_STRIDE		\
+	ALIGN(AUDIO_USB_REQUEST_FRAMES * sizeof(AudioPcmFrame), 64)
 
 #define AUDIO_THREAD_WAKE			0x01
 #define AUDIO_THREAD_DONE			0x02
@@ -76,7 +85,7 @@ struct AudioMemory {
 		__attribute__((aligned(64)));
 	AudioPcmFrame ring[AUDIO_RING_FRAMES]
 		__attribute__((aligned(64)));
-	unsigned char usb_packet[AUDIO_USB_QUEUE_DEPTH][AUDIO_USB_PACKET_STRIDE]
+	unsigned char usb_packet[AUDIO_USB_QUEUE_DEPTH][AUDIO_USB_REQUEST_STRIDE]
 		__attribute__((aligned(64)));
 } __attribute__((aligned(4096)));
 
@@ -89,8 +98,11 @@ _Static_assert((AUDIO_RING_FRAMES & AUDIO_RING_MASK) == 0,
 	"audio ring size must be a power of two");
 _Static_assert(AUDIO_USB_QUEUE_DEPTH <= 32,
 	"audio USB completion mask supports at most 32 slots");
-_Static_assert(AUDIO_USB_PACKET_STRIDE >= UAC_MAX_PACKET_SIZE,
-	"audio USB packet stride is too small");
+_Static_assert(AUDIO_USB_REQUEST_STRIDE >=
+	       AUDIO_USB_REQUEST_FRAMES * sizeof(AudioPcmFrame),
+	"audio USB request stride is too small");
+_Static_assert(UAC_NOMINAL_PACKET_FRAMES == UAC_MAX_PACKET_FRAMES,
+	"batched USB requests require fixed-size one-millisecond packets");
 
 static SceUdcdEndpoint *g_audio_endpoint;
 static SceUID g_audio_memory_uid = -1;
@@ -119,7 +131,6 @@ static SceInt32 g_usb_done_mask;
 
 static uint32_t g_ring_read;
 static uint32_t g_ring_write;
-static unsigned int g_usb_packet_sequence;
 static int g_ring_rebuffering;
 
 static int audio_resolve_monitor_functions(void)
@@ -210,15 +221,15 @@ static void audio_ring_push(const AudioPcmFrame *frames, unsigned int count)
 	ksceKernelUnlockFastMutex(&g_audio_ring_mutex);
 }
 
-static unsigned int audio_ring_pop_packet(unsigned char *packet)
+static unsigned int audio_ring_pop_request(unsigned char *request_data)
 {
-	AudioPcmFrame *dst = (AudioPcmFrame *)packet;
-	unsigned int count = UAC_NOMINAL_PACKET_FRAMES;
+	AudioPcmFrame *dst = (AudioPcmFrame *)request_data;
+	unsigned int count = AUDIO_USB_REQUEST_FRAMES;
 	unsigned int first;
 	unsigned int used;
 
-	memset(packet, 0,
-	       UAC_NOMINAL_PACKET_FRAMES * sizeof(AudioPcmFrame));
+	memset(request_data, 0,
+	       AUDIO_USB_REQUEST_FRAMES * sizeof(AudioPcmFrame));
 
 	ksceKernelLockFastMutex(&g_audio_ring_mutex);
 	used = g_ring_write - g_ring_read;
@@ -232,30 +243,15 @@ static unsigned int audio_ring_pop_packet(unsigned char *packet)
 	if (g_ring_rebuffering) {
 		if (used < AUDIO_RING_TARGET_FRAMES) {
 			ksceKernelUnlockFastMutex(&g_audio_ring_mutex);
-			return UAC_NOMINAL_PACKET_FRAMES;
+			return AUDIO_USB_REQUEST_FRAMES;
 		}
 		g_ring_rebuffering = 0;
 	}
 
-	/*
-	 * The UAC endpoint is asynchronous and has no feedback endpoint. Apply a
-	 * sparse 47/49-frame correction around the ring target to absorb the
-	 * small difference between the Vita and host USB clocks.
-	 */
-	if ((g_usb_packet_sequence & 1) == 0) {
-		if (used > AUDIO_RING_TARGET_FRAMES +
-			   AUDIO_RING_DRIFT_THRESHOLD)
-			count++;
-		else if (used < AUDIO_RING_TARGET_FRAMES -
-				AUDIO_RING_DRIFT_THRESHOLD)
-			count--;
-	}
-	g_usb_packet_sequence++;
-
 	if (used < count) {
 		g_ring_rebuffering = 1;
 		ksceKernelUnlockFastMutex(&g_audio_ring_mutex);
-		return UAC_NOMINAL_PACKET_FRAMES;
+		return AUDIO_USB_REQUEST_FRAMES;
 	}
 
 	first = AUDIO_RING_FRAMES - (g_ring_read & AUDIO_RING_MASK);
@@ -314,23 +310,24 @@ static int audio_usb_submit(unsigned int slot, unsigned int generation,
 			    int silence)
 {
 	struct AudioUsbSlot *usb_slot = &g_usb_slots[slot];
-	unsigned char *packet = g_audio_memory->usb_packet[slot];
+	unsigned char *request_data = g_audio_memory->usb_packet[slot];
 	unsigned int frames;
 	int ret;
 
 	if (silence) {
-		frames = UAC_NOMINAL_PACKET_FRAMES;
-		memset(packet, 0, frames * sizeof(AudioPcmFrame));
+		frames = AUDIO_USB_REQUEST_FRAMES;
+		memset(request_data, 0, frames * sizeof(AudioPcmFrame));
 	} else {
-		frames = audio_ring_pop_packet(packet);
+		frames = audio_ring_pop_request(request_data);
 	}
 
-	ksceKernelDcacheCleanRange(packet, frames * sizeof(AudioPcmFrame));
+	ksceKernelDcacheCleanRange(request_data,
+				  frames * sizeof(AudioPcmFrame));
 
 	usb_slot->generation = generation;
 	usb_slot->request = (SceUdcdDeviceRequest){
 		.endpoint = g_audio_endpoint,
-		.data = packet,
+		.data = request_data,
 		.attributes = SCE_UDCD_DEVICE_REQUEST_ATTR_PHYCONT,
 		.size = frames * sizeof(AudioPcmFrame),
 		.isControlRequest = 0,
@@ -415,7 +412,6 @@ static int audio_usb_thread(SceSize args, void *argp)
 				ksceKernelAtomicGetAndAdd32(&g_audio_generation, 0);
 			ksceKernelAtomicSet32(&g_usb_done_mask, 0);
 			ksceKernelAtomicSet32(&g_usb_in_flight, 0);
-			g_usb_packet_sequence = 0;
 			streaming = 1;
 
 			for (slot = 0; slot < AUDIO_USB_QUEUE_DEPTH; slot++) {
