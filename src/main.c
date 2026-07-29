@@ -7,6 +7,8 @@
 #include <psp2kern/lowio/iftu.h>
 #include <taihen.h>
 #include <string.h>
+#include "audio.h"
+#include "diagnostic.h"
 #include "usb_descriptors.h"
 #include "uvc.h"
 
@@ -51,23 +53,23 @@ int ksceLcdDisplayOff();
 int ksceLcdGetBrightness();
 int ksceLcdSetBrightness(int brightness);
 
-/* Copied from DolceSDK */
+/* Compatibility copy of the corrected SceIftuPlaneState definition. */
 typedef struct SceIftuPlaneState_updated {
 	SceIftuFrameBuf fb;
-	unsigned int unk20;             /* not observed to be non-zero */
-	unsigned int unk24;             /* not observed to be non-zero */
-	unsigned int unk28;             /* not observed to be non-zero */
-	unsigned int src_w;             /* inverse scaling factor in 16.16 fixed point, greater than or equal to 0.25 */
-	unsigned int src_h;             /* inverse scaling factor in 16.16 fixed point, greater than or equal to 0.25 */
-	unsigned int dst_x;             /* offset into the destination buffer */
-	unsigned int dst_y;             /* offset into the destination buffer */
-	unsigned int src_x;             /* offset into the source buffer in 8.8 fixed point, strictly less than 4.0 */
-	unsigned int src_y;             /* offset into the source buffer in 8.8 fixed point, strictly less than 4.0 */
+	unsigned int reserved[3];	/* Unused in FW 3.60 */
+	unsigned int src_w;		/* Inverse scaling factor in 16.16 fixed point. */
+	unsigned int src_h;		/* Inverse scaling factor in 16.16 fixed point. */
+	unsigned int dst_x;		/* Offset into the destination buffer. */
+	unsigned int dst_y;		/* Offset into the destination buffer. */
+	unsigned int src_x;		/* Offset into the source buffer in 8.8 fixed point. */
+	unsigned int src_y;		/* Offset into the source buffer in 8.8 fixed point. */
 	unsigned int crop_top;
-	unsigned int crop_bot;
+	unsigned int crop_bottom;
 	unsigned int crop_left;
 	unsigned int crop_right;
 } SceIftuPlaneState_updated;
+_Static_assert(sizeof(SceIftuPlaneState_updated) == 0x54,
+	"unexpected SceIftuPlaneState_updated size");
 
 /*
  * We want the data field (raw pixel data) to be aligned to 16B for the IFTU CSC to work properly.
@@ -452,6 +454,13 @@ static int uvc_udcd_change_setting(int interfaceNumber, int alternateSetting, in
 {
 	LOG("uvc_udcd_change %d %d\n", interfaceNumber, alternateSetting);
 
+	if (interfaceNumber == AUDIO_STREAM_INTERFACE) {
+		if (alternateSetting == 1)
+			return uac_audio_start();
+
+		uac_audio_request_stop();
+	}
+
 	return 0;
 }
 
@@ -460,6 +469,7 @@ static int uvc_udcd_attach(int usb_version, void *user_data)
 	LOG("uvc_udcd_attach %d\n", usb_version);
 
 	ksceUdcdClearFIFO(&endpoints[1]);
+	uac_audio_on_attach();
 
 #if defined(DISPLAY_OFF_OLED)
 	prev_brightness = ksceOledGetBrightness();
@@ -477,6 +487,7 @@ static void uvc_udcd_detach(void *user_data)
 	LOG("uvc_udcd_detach\n");
 
 	uvc_handle_video_abort();
+	uac_audio_request_stop();
 
 #if defined(DISPLAY_OFF_OLED)
 	ksceOledDisplayOn();
@@ -503,12 +514,13 @@ static int uvc_driver_stop(int size, void *p, void *user_data)
 {
 	LOG("uvc_driver_stop\n");
 
+	uac_audio_request_stop();
 	return 0;
 }
 
 static SceUdcdDriver uvc_udcd_driver = {
 	.driverName			= UVC_DRIVER_NAME,
-	.numEndpoints			= 2,
+	.numEndpoints			= 3,
 	.endpoints			= endpoints,
 	.interface			= &interface,
 	.descriptor_hi			= &devdesc_hi,
@@ -604,7 +616,7 @@ static int frame_convert_to_nv12(int fid, const SceDisplayFrameBufInfo *fb_info,
 	SceIftuConvParams params;
 	memset(&params, 0, sizeof(params));
 	params.size = sizeof(params);
-	params.unk04 = 0;
+	params.unk04 = 1;
 	params.csc_params1 = &RGB_to_YCbCr_JPEG_csc_params;
 	params.csc_params2 = NULL;
 	params.csc_control = 1;
@@ -622,17 +634,17 @@ static int frame_convert_to_nv12(int fid, const SceDisplayFrameBufInfo *fb_info,
 	src.fb.leftover_stride = (src_pitch - src_width_aligned) * src_pixelfmt_bpp;
 	src.fb.leftover_align = 0;
 	src.fb.paddr0 = src_paddr;
-	src.unk20 = 0;
-	src.unk24 = 0;
-	src.unk28 = 0;
+	src.reserved[0] = 0;
+	src.reserved[1] = 0;
+	src.reserved[2] = 0;
 	src.src_w = (src_width * 0x10000) / dst_width;
 	src.src_h = (src_height * 0x10000) / dst_height;
-	src.dst_x = 245760/512 - src_width/512;
-	src.dst_y = 139264/512 - src_height/512;
+	src.dst_x = 0;
+	src.dst_y = 0;
 	src.src_x = 0;
 	src.src_y = 0;
 	src.crop_top = 0;
-	src.crop_bot = 0;
+	src.crop_bottom = 0;
 	src.crop_left = 0;
 	src.crop_right = 0;
 
@@ -761,6 +773,7 @@ static int display_vblank_cb_func(int notifyId, int notifyCount, int notifyArg, 
 static int uvc_thread(SceSize args, void *argp)
 {
 	SceUID display_vblank_cb_uid;
+	int start_result;
 #if 0
 	/*
 	 * Wait until the MTP driver starts to takeover.
@@ -774,7 +787,9 @@ static int uvc_thread(SceSize args, void *argp)
 #endif
 
 	stream = 0;
-	uvc_start();
+	diagnostic_record("uvc_thread entered", 0);
+	start_result = uvc_start();
+	diagnostic_record("uvc_start", start_result);
 
 	display_vblank_cb_uid = ksceKernelCreateCallback("uvc_display_vblank", 0,
 							 display_vblank_cb_func, NULL);
@@ -861,15 +876,18 @@ int uvc_start(void)
 	 * Wait until there's a framebuffer set.
 	 */
 	ksceDisplayWaitSetFrameBufCB();
+	diagnostic_record("framebuffer ready", 0);
 
 #ifndef DEBUG
 	/*
 	 * Wait until LiveArea is more or less ready.
 	 */
 	ksceKernelDelayThreadCB(15 * 1000 * 1000);
+	diagnostic_record("LiveArea delay complete", 0);
 #endif
 
 	ret = ksceUdcdDeactivate();
+	diagnostic_record("ksceUdcdDeactivate", ret);
 	if (ret < 0 && ret != SCE_UDCD_ERROR_INVALID_ARGUMENT) {
 		LOG("Error deactivating UDCD (0x%08X)\n", ret);
 		return ret;
@@ -881,24 +899,28 @@ int uvc_start(void)
 	ksceUdcdStop("USBDeviceControllerDriver", 0, NULL);
 
 	ret = ksceUdcdStart("USBDeviceControllerDriver", 0, NULL);
+	diagnostic_record("start USBDeviceControllerDriver", ret);
 	if (ret < 0) {
 		LOG("Error starting the USBDeviceControllerDriver driver (0x%08X)\n", ret);
 		return ret;
 	}
 
 	ret = ksceUdcdStart(UVC_DRIVER_NAME, 0, NULL);
+	diagnostic_record("start VITAUVC00", ret);
 	if (ret < 0) {
 		LOG("Error starting the " UVC_DRIVER_NAME " driver (0x%08X)\n", ret);
 		goto err_start_uvc_driver;
 	}
 
 	ret = ksceUdcdActivate(UVC_USB_PID);
+	diagnostic_record("activate 0x1337", ret);
 	if (ret < 0) {
 		LOG("Error activating the " UVC_DRIVER_NAME " driver (0x%08X)\n", ret);
 		goto err_activate;
 	}
 
 	ret = uvc_frame_req_init();
+	diagnostic_record("uvc_frame_req_init", ret);
 	if (ret < 0) {
 		LOG("Error allocating USB request (0x%08X)\n", ret);
 		goto err_alloc_uvc_frame_req;
@@ -923,6 +945,12 @@ err_start_uvc_driver:
 
 int uvc_stop(void)
 {
+	int ret;
+
+	ret = uac_audio_stop_sync();
+	if (ret < 0)
+		LOG("Error stopping UAC audio (0x%08X)\n", ret);
+
 	ksceUdcdDeactivate();
 	ksceUdcdStop(UVC_DRIVER_NAME, 0, NULL);
 	ksceUdcdStop("USBDeviceControllerDriver", 0, NULL);
@@ -973,6 +1001,9 @@ int module_start(SceSize argc, const void *args)
 	int ret;
 	tai_module_info_t SceUdcd_modinfo;
 
+	diagnostic_reset();
+	diagnostic_record("module_start entered", 0);
+
 #ifdef DEBUG
 	log_reset();
 	framebuffer_map();
@@ -982,14 +1013,19 @@ int module_start(SceSize argc, const void *args)
 	LOG("udcd_uvc by xerpi\n");
 
 	SceUdcd_modinfo.size = sizeof(SceUdcd_modinfo);
-	taiGetModuleInfoForKernel(KERNEL_PID, "SceUdcd", &SceUdcd_modinfo);
+	ret = taiGetModuleInfoForKernel(KERNEL_PID, "SceUdcd",
+					&SceUdcd_modinfo);
+	diagnostic_record("taiGetModuleInfoForKernel SceUdcd", ret);
 
 	SceUdcd_sub_01E1128C_hook_uid = taiHookFunctionOffsetForKernel(KERNEL_PID,
 		&SceUdcd_sub_01E1128C_ref, SceUdcd_modinfo.modid, 0,
 		0x01E1128C - 0x01E10000, 1, SceUdcd_sub_01E1128C_hook_func);
+	diagnostic_record("taiHookFunctionOffsetForKernel",
+			  SceUdcd_sub_01E1128C_hook_uid);
 
 	uvc_thread_id = ksceKernelCreateThread("uvc_thread", uvc_thread,
 					       0x3C, 0x1000, 0, 0x10000, 0);
+	diagnostic_record("create uvc_thread", uvc_thread_id);
 	if (uvc_thread_id < 0) {
 		LOG("Error creating the UVC thread (0x%08X)\n", uvc_thread_id);
 		goto err_return;
@@ -997,29 +1033,42 @@ int module_start(SceSize argc, const void *args)
 
 	uvc_event_flag_id = ksceKernelCreateEventFlag("uvc_event_flag", 0,
 						      0, NULL);
+	diagnostic_record("create uvc_event_flag", uvc_event_flag_id);
 	if (uvc_event_flag_id < 0) {
 		LOG("Error creating the UVC event flag (0x%08X)\n", uvc_event_flag_id);
 		goto err_destroy_thread;
 	}
 
+	ret = uac_audio_init(&endpoints[2]);
+	diagnostic_record("uac_audio_init", ret);
+	if (ret < 0) {
+		LOG("Error initializing UAC audio (0x%08X)\n", ret);
+		goto err_delete_event_flag;
+	}
+
 	ret = ksceUdcdRegister(&uvc_udcd_driver);
+	diagnostic_record("ksceUdcdRegister VITAUVC00", ret);
 	if (ret < 0) {
 		LOG("Error registering the UDCD driver (0x%08X)\n", ret);
-		goto err_delete_event_flag;
+		goto err_audio_term;
 	}
 
 	uvc_thread_run = 1;
 
 	ret = ksceKernelStartThread(uvc_thread_id, 0, NULL);
+	diagnostic_record("start uvc_thread", ret);
 	if (ret < 0) {
 		LOG("Error starting the UVC thread (0x%08X)\n", ret);
 		goto err_unregister;
 	}
 
+	diagnostic_record("module_start success", 0);
 	return SCE_KERNEL_START_SUCCESS;
 
 err_unregister:
 	ksceUdcdUnregister(&uvc_udcd_driver);
+err_audio_term:
+	uac_audio_term();
 err_delete_event_flag:
 	ksceKernelDeleteEventFlag(uvc_event_flag_id);
 err_destroy_thread:
@@ -1030,6 +1079,10 @@ err_return:
 
 int module_stop(SceSize argc, const void *args)
 {
+	uac_audio_begin_shutdown();
+	if (uac_audio_stop_sync() < 0)
+		return SCE_KERNEL_STOP_FAIL;
+
 	uvc_thread_run = 0;
 
 	ksceKernelSetEventFlag(uvc_event_flag_id, 1);
@@ -1044,6 +1097,9 @@ int module_stop(SceSize argc, const void *args)
 	ksceUdcdStop(UVC_DRIVER_NAME, 0, NULL);
 	ksceUdcdStop("USBDeviceControllerDriver", 0, NULL);
 	ksceUdcdUnregister(&uvc_udcd_driver);
+
+	if (uac_audio_term() < 0)
+		return SCE_KERNEL_STOP_FAIL;
 
 	if (SceUdcd_sub_01E1128C_hook_uid > 0) {
 		taiHookReleaseForKernel(SceUdcd_sub_01E1128C_hook_uid,

@@ -2,7 +2,8 @@
 
 ## What's this?
 
-This is a kernel plugin that lets you stream your PSVita screen to your computer via USB.
+This is a kernel plugin that lets you stream your PSVita screen and its final
+software audio mix to your computer via USB.
 
 ## How does it work?
 
@@ -11,6 +12,11 @@ the necessary USB descriptors to simulate and behave as an [USB Video Class](htt
 
 The [hardware color space converter](https://wiki.henkaku.xyz/vita/IFTU_Registers) of the PSVita's SoC is used to perform the conversion to the destination pixel format; then the USB
 controller directly performs a DMA transfer from the physical address of the resulting converted framebuffer, and therefore, saving CPU usage and power consumption.
+
+Audio is exposed to the computer as a USB Audio Class 1.0 capture/input device
+using 48 kHz, stereo, signed 16-bit PCM. It captures the final mix produced by
+SceAudio and SceAudioSource before the handheld codec applies
+speaker/headphone volume or mute. It does not capture the microphone.
 
 ## Supported formats and resolutions
 
@@ -48,10 +54,8 @@ If you use Windows 10 you might have to change the Camera access permissions on 
 
 On Linux I recommend using *mplayer* (`mplayer tv:// -tv driver=v4l2:device=/dev/videoX:width=960:height=544`).
 
-**Audio noise fix:**
-
-* Disable USB power supply (Settings > System)
+The Vita's Bluetooth audio path uses the same single firmware monitor slot as
+USB audio capture. Do not use Bluetooth audio while USB audio streaming is
+active; simultaneous use is not supported.
 
 Note: Remember that if anything goes wrong (like PSVita not booting) you can always press L at boot to skip plugin loading.
-
-Note 2: No, it *doesn't* stream audio. For that use a 3.5mm jack to jack adapter (a ferrite bead might help reduce the electromagnetic noise).
