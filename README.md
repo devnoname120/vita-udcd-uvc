@@ -46,6 +46,35 @@ ur0:tai/udcd_uvc.skprx
 ```
 3. Reboot your PSVita.
 
+## Listening to audio on macOS
+
+The audio function appears as an input device named `PSVita`. Applications
+that read it through CoreAudio receive 48 kHz stereo audio directly.
+
+The `avfoundation` input in the tested Homebrew FFmpeg 8.1.2 build drops some
+audio sample buffers even though CoreAudio receives a continuous stream. For
+reliable command-line playback, build the included CoreAudio bridge and pipe
+its unchanged 32-bit float samples to `ffplay`:
+
+```sh
+clang -std=c11 -D_DARWIN_C_SOURCE -O2 -Wall -Wextra \
+  -framework CoreAudio -framework CoreFoundation \
+  tools/coreaudio-stream.c -o tools/coreaudio-stream
+
+tools/coreaudio-stream PSVita | \
+  ffplay -nodisp -f f32le -ar 48000 -ch_layout stereo -i pipe:0
+```
+
+To make a lossless command-line recording instead:
+
+```sh
+tools/coreaudio-stream PSVita | \
+  ffmpeg -f f32le -ar 48000 -ch_layout stereo -i pipe:0 \
+    -c:a pcm_f32le vita-audio.wav
+```
+
+Press Ctrl-C to stop either pipeline.
+
 ## Troubleshooting
 
 If the video looks glitched, try to change the video player configuration to use the *NV12* format or switch to another player (like PotPlayer or OBS). If the colors look wrong, set color range to full and color space to BT.601 (Rec. 601).
