@@ -20,6 +20,7 @@ speaker/headphone volume or mute. It does not capture the microphone.
 
 ## Supported formats and resolutions
 
+* Audio: 48 kHz stereo signed 16-bit PCM (1,536 kb/s)
 * 960x544 @ 30 FPS and (less than) 60 FPS
 * 896x504 @ 30 FPS and (almost) 60 FPS
 * 864x488 @ 30 FPS and 60 FPS
