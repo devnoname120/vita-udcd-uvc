@@ -18,6 +18,14 @@ using 48 kHz, stereo, signed 16-bit PCM. It captures the final mix produced by
 SceAudio and SceAudioSource before the handheld codec applies
 speaker/headphone volume or mute. It does not capture the microphone.
 
+Unlike audio-capture plugins that hook individual audio ports as they are
+opened and closed (BGM, sound effects, and similar sources), this plugin
+captures the already-combined final digital mix immediately before it is
+routed to the speaker/headphone codec. The USB stream therefore contains the
+mix actually produced by the Vita instead of a best-effort reconstruction
+performed by the plugin. Reconstructing the mix from separate ports can miss
+audio, lose synchronization, or produce clicks, gaps, and other glitches.
+
 Due to a PS Vita audio-routing limitation, sound is not played through the
 Vita speakers while the computer is actively capturing the USB audio stream.
 Speaker playback resumes immediately when the computer stops capturing audio
