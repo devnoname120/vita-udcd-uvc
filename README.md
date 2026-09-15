@@ -18,6 +18,11 @@ using 48 kHz, stereo, signed 16-bit PCM. It captures the final mix produced by
 SceAudio and SceAudioSource before the handheld codec applies
 speaker/headphone volume or mute. It does not capture the microphone.
 
+Due to a PS Vita audio-routing limitation, sound is not played through the
+Vita speakers while the computer is actively capturing the USB audio stream.
+Speaker playback resumes immediately when the computer stops capturing audio
+or the USB cable is disconnected.
+
 ## Supported formats and resolutions
 
 ### Audio
