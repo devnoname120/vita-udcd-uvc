@@ -1,5 +1,6 @@
 #include <psp2/kernel/error.h>
 #include <psp2kern/kernel/cpu.h>
+#include <psp2kern/kernel/cpu/spinlock.h>
 #include <psp2kern/kernel/dmac.h>
 #include <psp2kern/kernel/sysmem.h>
 #include <psp2kern/kernel/threadmgr.h>
@@ -23,26 +24,30 @@
 	((1u << AUDIO_CAPTURE_BUFFER_COUNT) - 1)
 
 /*
- * SceAudio 3.60 configures three SourceMixer instances at physical bases
- * E04A0000, E04B0000 and E04C0000. SourceMixer0 proves that +0x240 is an
- * auxiliary PCM FIFO and register 39 (+0x9C) controls it independently from
- * the main FIFO at +0x200/register 38 (+0x98).
+ * SceAudio's normal SrcMix1 MAIN output writes the complete local mix to the
+ * selected I2S sink. Firmware 3.60 initializes the handheld route to I2S7,
+ * which is a final sink rather than one of the I2S0..2 capture/loopback ports.
+ * Attempting to read I2S7's TX FIFO therefore arms DMA successfully but never
+ * receives a peripheral request.
  *
- * The output request sequence is 0x54000 (SrcMix0 main), 0x58000 (SrcMix0
- * auxiliary), 0x5C000 (SrcMix1 main) and 0x64000 (SrcMix2 main). Hardware
- * validation confirms that the symmetric 0x60000 request reads SrcMix1's
- * auxiliary FIFO, although stock firmware never uses it. SceAudio assigns its
- * three operations per mixer to DMAC4 channels 0 through 8, so this independent
- * capture uses channel 9 and leaves the stock SrcMix1 main/ch5 speaker
- * operation untouched.
+ * SourceMixer hardware also exposes a secondary output FIFO. Sony uses
+ * SrcMix0's secondary FIFO and control register 39 as a non-destructive monitor
+ * while its MAIN output continues feeding SrcMix1. Mirror that exact design one
+ * stage later: enable SrcMix1 register 39 only after arming a FIFO-to-RAM DMAC4
+ * chain, then drain SrcMix1 +0x240 using the adjacent request selector 0x60000.
+ * The normal MAIN-to-I2S7 route remains untouched.
+ *
+ * SrcMix0 secondary readback uses DMAC4 channel 4, the next mixer's input-1
+ * channel. The corresponding SrcMix1 secondary path is channel 7 (SrcMix2
+ * input-1). SceAudio allocates that operation but leaves it idle unless the
+ * private I2S0 capture API is called, so runtime guards reject an active owner.
+ * The audio buffers use a non-cacheable mapping and must not set COHERENT_DST.
  */
-#define SRCMIX_AUX_CONTROL_REGISTER		39
-#define SRCMIX_AUX_ENABLE			0x00010001
-#define SRCMIX_AUX_DMAC_COMPLETION		0x00002000
-#define SRCMIX_AUX_DMAC_DIRECTION		0x05000000
-#define SRCMIX_AUX_DMAC_TAIL_BYTES		256
-#define SRCMIX_AUX_DMAC_BLOCK_SIZE		16
-#define SRCMIX_AUX_DMAC_ERROR_MASK		\
+#define SRCMIX1_SECONDARY_DMAC_COMPLETION	0x00002000
+#define SRCMIX1_SECONDARY_DMAC_DIRECTION	0x05000000
+#define SRCMIX1_SECONDARY_DMAC_TAIL_BYTES	256
+#define SRCMIX1_SECONDARY_DMAC_BLOCK_SIZE	16
+#define SRCMIX1_SECONDARY_DMAC_ERROR_MASK	\
 	(SCE_KERNEL_DMAC_STAT_ABORTED |		\
 	 SCE_KERNEL_DMAC_STAT_ERROR_READ |	\
 	 SCE_KERNEL_DMAC_STAT_ERROR_WRITE |	\
@@ -53,31 +58,30 @@
 /*
  * Runtime layout guards for the 3.60 SceAudio data segment. This project is
  * already firmware-specific, but checking the neighboring initialized tags
- * prevents an unknown SceAudio build from turning these offsets into unsafe
- * MMIO writes.
+ * prevents an unknown SceAudio build from arming DMA against the wrong
+ * peripheral.
  */
-#define SCE_AUDIO_SRCMIX0_AUX_SOURCE_OFFSET	0xBA48
-#define SCE_AUDIO_SRCMIX0_AUX_DEST_OFFSET	0xBA4C
-#define SCE_AUDIO_SRCMIX0_AUX_COMMAND_OFFSET	0xBAB0
 #define SCE_AUDIO_SRCMIX1_MAIN_SOURCE_OFFSET	0xBAB4
 #define SCE_AUDIO_SRCMIX1_MAIN_DEST_OFFSET	0xBAB8
 #define SCE_AUDIO_SRCMIX1_MAIN_COMMAND_OFFSET	0xBB1C
-#define SCE_AUDIO_SRCMIX1_REGS_POINTER_OFFSET	0xBB24
-#define SCE_AUDIO_SRCMIX2_MAIN_SOURCE_OFFSET	0xBC20
-#define SCE_AUDIO_SRCMIX2_MAIN_COMMAND_OFFSET	0xBC88
+#define SCE_AUDIO_SRCMIX1_REGS_OFFSET		0xBB24
+#define SCE_AUDIO_SRCMIX1_OUTPUT_MODE_OFFSET	0xBB28
+#define SCE_AUDIO_SRCMIX1_SPINLOCK_OFFSET	0xBB44
+#define SCE_AUDIO_SRCMIX2_INPUT1_STATE_OFFSET	0xBC14
+#define SCE_AUDIO_I2S_ENABLED_MASK_OFFSET	0xBD21
+#define SCE_AUDIO_SELECTED_I2S_INDEX_OFFSET	0xBD22
+#define SCE_AUDIO_SRCMIX2_INPUT_I2S_OFFSET	0xBD23
 
-#define SCE_AUDIO_SRCMIX0_AUX_FIFO_PHYSICAL	0xE04A0240
-#define SCE_AUDIO_SRCMIX0_AUX_DMAC_COMMAND	0x00058000
 #define SCE_AUDIO_SRCMIX1_MAIN_FIFO_PHYSICAL	0xE04B0200
 #define SCE_AUDIO_SRCMIX1_MAIN_DMAC_COMMAND	0x0005C000
-#define SCE_AUDIO_SRCMIX2_MAIN_FIFO_PHYSICAL	0xE04C0200
-#define SCE_AUDIO_SRCMIX2_MAIN_DMAC_COMMAND	0x02064000
-
-#define SRCMIX_AUX_DMAC_CHANNEL			9
-#define SRCMIX_AUX_FIFO_PHYSICAL		((const void *)0xE04B0240)
-#define SRCMIX_AUX_DMAC_COMMAND			0x00060000
-#define SCE_AUDIO_SRCMIX_REGS_POINTER_OFFSET	\
-	SCE_AUDIO_SRCMIX1_REGS_POINTER_OFFSET
+#define SCE_AUDIO_HANDHELD_I2S_INDEX		7
+#define SCE_AUDIO_HANDHELD_I2S_FIFO_PHYSICAL	0xE0490100
+#define SRCMIX1_SECONDARY_FIFO_PHYSICAL		((const void *)0xE04B0240)
+#define SRCMIX1_SECONDARY_DMAC_COMMAND		0x00060000
+#define SRCMIX1_SECONDARY_DMAC_CHANNEL		7
+#define SRCMIX_SECONDARY_CONTROL_INDEX		39
+#define SRCMIX_SECONDARY_CONTROL_DISABLED	0x00000000
+#define SRCMIX_SECONDARY_CONTROL_ENABLED		0x00010001
 
 #define AUDIO_RING_FRAMES			8192
 #define AUDIO_RING_MASK				(AUDIO_RING_FRAMES - 1)
@@ -173,11 +177,14 @@ _Static_assert(AUDIO_CAPTURE_INITIAL_QUEUE_DEPTH >= 2 &&
 _Static_assert(AUDIO_CAPTURE_BUFFER_COUNT < 32,
 	"audio DMA buffer masks must fit in a signed 32-bit atomic");
 _Static_assert(sizeof(AudioPcmFrame) * AUDIO_CAPTURE_FRAMES >
-	       SRCMIX_AUX_DMAC_TAIL_BYTES,
+	       SRCMIX1_SECONDARY_DMAC_TAIL_BYTES,
 	"audio DMA period must contain a body and a 256-byte tail");
 _Static_assert((sizeof(AudioPcmFrame) * AUDIO_CAPTURE_FRAMES) %
-	       SRCMIX_AUX_DMAC_BLOCK_SIZE == 0,
-	"audio DMA period must be a multiple of the SourceMixer block size");
+	       SRCMIX1_SECONDARY_DMAC_BLOCK_SIZE == 0,
+	"audio DMA period must be a multiple of the SrcMix transfer block size");
+_Static_assert(SRCMIX1_SECONDARY_DMAC_COMMAND ==
+	       SCE_AUDIO_SRCMIX1_MAIN_DMAC_COMMAND + 0x4000,
+	"SrcMix1 secondary request must immediately follow its main request");
 
 static SceUdcdEndpoint *g_audio_endpoint;
 static SceUID g_audio_memory_uid = -1;
@@ -201,7 +208,10 @@ static const SceKernelDmaOpChainParam g_capture_dma_chain_param = {
 };
 
 static SceKernelDmaOpId g_capture_dma_op_id = -1;
-static volatile uint32_t *g_srcmix_aux_regs;
+static volatile uint32_t *g_srcmix1_regs;
+static SceKernelSpinlock *g_srcmix1_spinlock;
+static volatile unsigned char *g_srcmix1_output_mode;
+static volatile uint32_t *g_srcmix2_input1_state;
 
 static SceInt32 g_audio_initialized;
 static SceInt32 g_audio_exit;
@@ -249,16 +259,25 @@ static uint32_t g_ring_write;
 static int g_ring_rebuffering;
 
 static void audio_capture_dma_prepare_period(unsigned int period);
-static void audio_srcmix_barrier(void);
 #ifdef DIAGNOSTIC
 static int audio_capture_dma_period_tags_changed(unsigned int period);
 #endif
 
-static int audio_resolve_srcmix_aux(void)
+static inline void audio_data_sync_barrier(void)
+{
+	__asm__ volatile("dsb sy" ::: "memory");
+}
+
+static int audio_resolve_srcmix1_secondary(void)
 {
 	tai_module_info_t module_info;
+	volatile unsigned char *data_bytes;
 	volatile uint32_t *data;
+	volatile uint32_t *srcmix1_regs;
+	SceKernelSpinlock *srcmix1_spinlock;
+	SceKernelIntrStatus interrupt_state;
 	uintptr_t data_address;
+	uint32_t secondary_control;
 	int ret;
 
 	memset(&module_info, 0, sizeof(module_info));
@@ -274,63 +293,74 @@ static int audio_resolve_srcmix_aux(void)
 	if (ret < 0)
 		return ret;
 	data = (volatile uint32_t *)data_address;
+	data_bytes = (volatile unsigned char *)data_address;
 
-	diagnostic_record("SceAudio SrcMix0 aux source",
-		data[SCE_AUDIO_SRCMIX0_AUX_SOURCE_OFFSET / sizeof(uint32_t)]);
-	diagnostic_record("SceAudio SrcMix0 aux destination",
-		data[SCE_AUDIO_SRCMIX0_AUX_DEST_OFFSET / sizeof(uint32_t)]);
-	diagnostic_record("SceAudio SrcMix0 aux command",
-		data[SCE_AUDIO_SRCMIX0_AUX_COMMAND_OFFSET / sizeof(uint32_t)]);
 	diagnostic_record("SceAudio SrcMix1 main source",
 		data[SCE_AUDIO_SRCMIX1_MAIN_SOURCE_OFFSET / sizeof(uint32_t)]);
 	diagnostic_record("SceAudio SrcMix1 main destination",
 		data[SCE_AUDIO_SRCMIX1_MAIN_DEST_OFFSET / sizeof(uint32_t)]);
-	diagnostic_record("SceAudio SrcMix1 main command",
+	diagnostic_record("SceAudio SrcMix1 main base command",
 		data[SCE_AUDIO_SRCMIX1_MAIN_COMMAND_OFFSET / sizeof(uint32_t)]);
-	diagnostic_record("SceAudio SrcMix2 main source",
-		data[SCE_AUDIO_SRCMIX2_MAIN_SOURCE_OFFSET / sizeof(uint32_t)]);
-	diagnostic_record("SceAudio SrcMix2 main command",
-		data[SCE_AUDIO_SRCMIX2_MAIN_COMMAND_OFFSET / sizeof(uint32_t)]);
+	diagnostic_record("SceAudio SrcMix1 output mode",
+		data_bytes[SCE_AUDIO_SRCMIX1_OUTPUT_MODE_OFFSET]);
+	diagnostic_record("SceAudio SrcMix2 input1 DMA state",
+		data[SCE_AUDIO_SRCMIX2_INPUT1_STATE_OFFSET / sizeof(uint32_t)]);
+	diagnostic_record("SceAudio enabled I2S mask",
+		data_bytes[SCE_AUDIO_I2S_ENABLED_MASK_OFFSET]);
+	diagnostic_record("SceAudio selected I2S index",
+		data_bytes[SCE_AUDIO_SELECTED_I2S_INDEX_OFFSET]);
+	diagnostic_record("SceAudio SrcMix2 capture I2S index",
+		data_bytes[SCE_AUDIO_SRCMIX2_INPUT_I2S_OFFSET]);
 
-	if (data[SCE_AUDIO_SRCMIX0_AUX_SOURCE_OFFSET / sizeof(uint32_t)] !=
-		    SCE_AUDIO_SRCMIX0_AUX_FIFO_PHYSICAL ||
-	    data[SCE_AUDIO_SRCMIX0_AUX_COMMAND_OFFSET / sizeof(uint32_t)] !=
-		    SCE_AUDIO_SRCMIX0_AUX_DMAC_COMMAND ||
-	    data[SCE_AUDIO_SRCMIX1_MAIN_SOURCE_OFFSET / sizeof(uint32_t)] !=
+	srcmix1_regs = (volatile uint32_t *)(uintptr_t)
+		data[SCE_AUDIO_SRCMIX1_REGS_OFFSET / sizeof(uint32_t)];
+	srcmix1_spinlock = (SceKernelSpinlock *)
+		(data_bytes + SCE_AUDIO_SRCMIX1_SPINLOCK_OFFSET);
+	if (!srcmix1_regs || ((uintptr_t)srcmix1_regs & 3u))
+		return SCE_UDCD_ERROR_INVALID_ARGUMENT;
+
+	interrupt_state =
+		ksceKernelSpinlockLowLockCpuSuspendIntr(srcmix1_spinlock);
+	secondary_control =
+		srcmix1_regs[SRCMIX_SECONDARY_CONTROL_INDEX];
+	ksceKernelSpinlockLowUnlockCpuResumeIntr(srcmix1_spinlock,
+		interrupt_state);
+	diagnostic_record("SceAudio SrcMix1 secondary control",
+		(int)secondary_control);
+
+	/*
+	 * The normal final route must still be SrcMix1 MAIN to I2S7. Refuse to
+	 * collide with either firmware monitor mode, an already-enabled secondary
+	 * output, or SceAudio's private channel-7 operation.
+	 */
+	if (data[SCE_AUDIO_SRCMIX1_MAIN_SOURCE_OFFSET / sizeof(uint32_t)] !=
 		    SCE_AUDIO_SRCMIX1_MAIN_FIFO_PHYSICAL ||
+	    data[SCE_AUDIO_SRCMIX1_MAIN_DEST_OFFSET / sizeof(uint32_t)] !=
+		    SCE_AUDIO_HANDHELD_I2S_FIFO_PHYSICAL ||
 	    data[SCE_AUDIO_SRCMIX1_MAIN_COMMAND_OFFSET / sizeof(uint32_t)] !=
 		    SCE_AUDIO_SRCMIX1_MAIN_DMAC_COMMAND ||
-	    data[SCE_AUDIO_SRCMIX2_MAIN_SOURCE_OFFSET / sizeof(uint32_t)] !=
-		    SCE_AUDIO_SRCMIX2_MAIN_FIFO_PHYSICAL ||
-	    data[SCE_AUDIO_SRCMIX2_MAIN_COMMAND_OFFSET / sizeof(uint32_t)] !=
-		    SCE_AUDIO_SRCMIX2_MAIN_DMAC_COMMAND)
+	    data_bytes[SCE_AUDIO_SRCMIX1_OUTPUT_MODE_OFFSET] != 0 ||
+	    data[SCE_AUDIO_SRCMIX2_INPUT1_STATE_OFFSET / sizeof(uint32_t)] != 0 ||
+	    secondary_control != SRCMIX_SECONDARY_CONTROL_DISABLED ||
+	    !(data_bytes[SCE_AUDIO_I2S_ENABLED_MASK_OFFSET] &
+	      (1u << SCE_AUDIO_HANDHELD_I2S_INDEX)) ||
+	    data_bytes[SCE_AUDIO_SELECTED_I2S_INDEX_OFFSET] !=
+		    SCE_AUDIO_HANDHELD_I2S_INDEX)
 		return SCE_UDCD_ERROR_INVALID_ARGUMENT;
 
-	g_srcmix_aux_regs = (volatile uint32_t *)(uintptr_t)
-		data[SCE_AUDIO_SRCMIX_REGS_POINTER_OFFSET / sizeof(uint32_t)];
-	diagnostic_record("SceAudio capture SrcMix mapping",
-			  (int)(uintptr_t)g_srcmix_aux_regs);
-	if (!g_srcmix_aux_regs || ((uintptr_t)g_srcmix_aux_regs & 3))
-		return SCE_UDCD_ERROR_INVALID_ARGUMENT;
-	diagnostic_record("SceAudio capture aux control",
-		(int)g_srcmix_aux_regs[SRCMIX_AUX_CONTROL_REGISTER]);
-	if (g_srcmix_aux_regs[SRCMIX_AUX_CONTROL_REGISTER] != 0)
-		return SCE_UDCD_ERROR_DRIVER_IN_PROGRESS;
-
+	g_srcmix1_regs = srcmix1_regs;
+	g_srcmix1_spinlock = srcmix1_spinlock;
+	g_srcmix1_output_mode =
+		data_bytes + SCE_AUDIO_SRCMIX1_OUTPUT_MODE_OFFSET;
+	g_srcmix2_input1_state =
+		&data[SCE_AUDIO_SRCMIX2_INPUT1_STATE_OFFSET /
+		      sizeof(uint32_t)];
 	return 0;
 }
 
 static void audio_capture_dma_fail(int stage, int failure,
 				   SceUInt32 bytes_processed)
 {
-	/*
-	 * Match SceAudio's callback stop path: stop the auxiliary producer
-	 * immediately, then let the worker dequeue and release the operation.
-	 */
-	if (g_srcmix_aux_regs) {
-		g_srcmix_aux_regs[SRCMIX_AUX_CONTROL_REGISTER] = 0;
-		audio_srcmix_barrier();
-	}
 	ksceKernelAtomicSet32(&g_capture_dma_error_stage, stage);
 	ksceKernelAtomicSet32(&g_capture_dma_error_status, failure);
 	ksceKernelAtomicSet32(&g_capture_dma_error_bytes,
@@ -365,7 +395,7 @@ static int audio_capture_dma_complete(SceKernelDmaOpId op_id,
 		g_capture_dma_callback_busy_count++;
 #endif
 
-	if ((hardware_status & SRCMIX_AUX_DMAC_ERROR_MASK) ||
+	if ((hardware_status & SRCMIX1_SECONDARY_DMAC_ERROR_MASK) ||
 	    bytes_processed !=
 		    sizeof(g_audio_memory->capture[0])) {
 		audio_capture_dma_fail(
@@ -459,32 +489,32 @@ static void audio_capture_dma_prepare_period(unsigned int period)
 	 * for cached monitor destinations; applying it to this non-cacheable
 	 * alias produces incomplete destination writes on DMAC4.
 	 */
-	const unsigned int command = SRCMIX_AUX_DMAC_COMMAND;
+	const unsigned int command = SRCMIX1_SECONDARY_DMAC_COMMAND;
 	unsigned char *destination =
 		(unsigned char *)g_audio_memory->capture[period];
 	SceKernelDmaOpTag *tag = g_capture_dma_period[period].tag;
 
 	tag[0] = (SceKernelDmaOpTag){
-		.src = SRCMIX_AUX_FIFO_PHYSICAL,
+		.src = SRCMIX1_SECONDARY_FIFO_PHYSICAL,
 		.dst = destination,
-		.len = SRCMIX_AUX_DMAC_DIRECTION |
-		       (period_bytes - SRCMIX_AUX_DMAC_TAIL_BYTES),
+		.len = SRCMIX1_SECONDARY_DMAC_DIRECTION |
+		       (period_bytes - SRCMIX1_SECONDARY_DMAC_TAIL_BYTES),
 		.cmd = command,
 		.keyring = 0,
 		.iv = NULL,
-		.blockSize = SRCMIX_AUX_DMAC_BLOCK_SIZE,
+		.blockSize = SRCMIX1_SECONDARY_DMAC_BLOCK_SIZE,
 		.pNext = &tag[1]
 	};
 	tag[1] = (SceKernelDmaOpTag){
-		.src = SRCMIX_AUX_FIFO_PHYSICAL,
+		.src = SRCMIX1_SECONDARY_FIFO_PHYSICAL,
 		.dst = destination + period_bytes -
-		       SRCMIX_AUX_DMAC_TAIL_BYTES,
-		.len = SRCMIX_AUX_DMAC_DIRECTION |
-		       SRCMIX_AUX_DMAC_TAIL_BYTES,
-		.cmd = command | SRCMIX_AUX_DMAC_COMPLETION,
+		       SRCMIX1_SECONDARY_DMAC_TAIL_BYTES,
+		.len = SRCMIX1_SECONDARY_DMAC_DIRECTION |
+		       SRCMIX1_SECONDARY_DMAC_TAIL_BYTES,
+		.cmd = command | SRCMIX1_SECONDARY_DMAC_COMPLETION,
 		.keyring = 0,
 		.iv = NULL,
-		.blockSize = SRCMIX_AUX_DMAC_BLOCK_SIZE,
+		.blockSize = SRCMIX1_SECONDARY_DMAC_BLOCK_SIZE,
 		.pNext = SCE_KERNEL_DMAC_CHAIN_END
 	};
 }
@@ -494,33 +524,34 @@ static int audio_capture_dma_period_tags_changed(unsigned int period)
 {
 	const unsigned int period_bytes =
 		sizeof(g_audio_memory->capture[period]);
-	const unsigned int command = SRCMIX_AUX_DMAC_COMMAND;
+	const unsigned int command = SRCMIX1_SECONDARY_DMAC_COMMAND;
 	const unsigned char *destination =
 		(const unsigned char *)g_audio_memory->capture[period];
 	const SceKernelDmaOpTag *tag =
 		g_capture_dma_period[period].tag;
 
-	return tag[0].src != SRCMIX_AUX_FIFO_PHYSICAL ||
+	return tag[0].src != SRCMIX1_SECONDARY_FIFO_PHYSICAL ||
 	       tag[0].dst != destination ||
 	       tag[0].len !=
-		       (SRCMIX_AUX_DMAC_DIRECTION |
-			(period_bytes - SRCMIX_AUX_DMAC_TAIL_BYTES)) ||
+		       (SRCMIX1_SECONDARY_DMAC_DIRECTION |
+			(period_bytes - SRCMIX1_SECONDARY_DMAC_TAIL_BYTES)) ||
 	       tag[0].cmd != command ||
 	       tag[0].keyring != 0 ||
 	       tag[0].iv != NULL ||
-	       tag[0].blockSize != SRCMIX_AUX_DMAC_BLOCK_SIZE ||
+	       tag[0].blockSize != SRCMIX1_SECONDARY_DMAC_BLOCK_SIZE ||
 	       tag[0].pNext != &g_capture_dma_period[period].tag[1] ||
-	       tag[1].src != SRCMIX_AUX_FIFO_PHYSICAL ||
+	       tag[1].src != SRCMIX1_SECONDARY_FIFO_PHYSICAL ||
 	       tag[1].dst !=
 		       destination + period_bytes -
-			       SRCMIX_AUX_DMAC_TAIL_BYTES ||
+			       SRCMIX1_SECONDARY_DMAC_TAIL_BYTES ||
 	       tag[1].len !=
-		       (SRCMIX_AUX_DMAC_DIRECTION |
-			SRCMIX_AUX_DMAC_TAIL_BYTES) ||
-	       tag[1].cmd != (command | SRCMIX_AUX_DMAC_COMPLETION) ||
+		       (SRCMIX1_SECONDARY_DMAC_DIRECTION |
+			SRCMIX1_SECONDARY_DMAC_TAIL_BYTES) ||
+	       tag[1].cmd !=
+		       (command | SRCMIX1_SECONDARY_DMAC_COMPLETION) ||
 	       tag[1].keyring != 0 ||
 	       tag[1].iv != NULL ||
-	       tag[1].blockSize != SRCMIX_AUX_DMAC_BLOCK_SIZE ||
+	       tag[1].blockSize != SRCMIX1_SECONDARY_DMAC_BLOCK_SIZE ||
 	       tag[1].pNext != SCE_KERNEL_DMAC_CHAIN_END;
 }
 
@@ -600,20 +631,21 @@ static int audio_capture_dma_init(void)
 	int ret;
 
 	g_capture_dma_op_id = ksceKernelDmaOpAlloc("uac_srcmix1_aux");
-	diagnostic_record("allocate SrcMix1 aux DMA", g_capture_dma_op_id);
+	diagnostic_record("allocate SrcMix1 secondary DMA",
+		g_capture_dma_op_id);
 	if (g_capture_dma_op_id < 0)
 		return g_capture_dma_op_id;
 
 	ret = ksceKernelDmaOpSetCallback(g_capture_dma_op_id,
 					callback.sdk, NULL);
-	diagnostic_record("set SrcMix1 aux DMA callback", ret);
+	diagnostic_record("set SrcMix1 secondary DMA callback", ret);
 	if (ret < 0)
 		goto fail;
 
 	ret = ksceKernelDmaOpAssign(g_capture_dma_op_id,
 				   SCE_KERNEL_DMAC_ID_DMAC4,
-				   SRCMIX_AUX_DMAC_CHANNEL);
-	diagnostic_record("assign SrcMix1 aux DMA channel", ret);
+				   SRCMIX1_SECONDARY_DMAC_CHANNEL);
+	diagnostic_record("assign SrcMix1 secondary DMA channel", ret);
 	if (ret < 0)
 		goto fail;
 
@@ -643,34 +675,31 @@ static int audio_capture_dma_term(void)
 		return SCE_UDCD_ERROR_DRIVER_IN_PROGRESS;
 
 	ret = ksceKernelDmaOpFree(g_capture_dma_op_id);
-	diagnostic_record("free SrcMix1 aux DMA", ret);
+	diagnostic_record("free SrcMix1 secondary DMA", ret);
 	if (ret < 0)
 		return ret;
 
 	g_capture_dma_op_id = -1;
-	g_srcmix_aux_regs = NULL;
 	return 0;
-}
-
-static void audio_srcmix_barrier(void)
-{
-	__asm__ volatile("dsb sy" ::: "memory");
 }
 
 static int audio_capture_dma_start(void)
 {
+	SceKernelIntrStatus interrupt_state;
 	unsigned int period;
 	unsigned int ignored;
+	int append_attempted = 0;
+	int append_ret = 0;
+	int enqueue_attempted = 0;
+	int enqueue_ret = 0;
 	int setup_done = 0;
+	int setup_ret;
 	int ret;
 
-	if (!g_srcmix_aux_regs || g_capture_dma_op_id < 0)
+	if (g_capture_dma_op_id < 0 || !g_srcmix1_regs ||
+	    !g_srcmix1_spinlock || !g_srcmix1_output_mode ||
+	    !g_srcmix2_input1_state)
 		return SCE_UDCD_ERROR_INVALID_ARGUMENT;
-	if (g_srcmix_aux_regs[SRCMIX_AUX_CONTROL_REGISTER] != 0)
-		return SCE_UDCD_ERROR_DRIVER_IN_PROGRESS;
-
-	g_srcmix_aux_regs[SRCMIX_AUX_CONTROL_REGISTER] = 0;
-	audio_srcmix_barrier();
 
 	ksceKernelAtomicSet32(&g_capture_dma_done_mask, 0);
 	ksceKernelAtomicSet32(
@@ -706,42 +735,80 @@ static int audio_capture_dma_start(void)
 #endif
 	}
 
-	ret = ksceKernelDmaOpSetupChain(g_capture_dma_op_id,
+	/*
+	 * Match Sony's secondary-monitor start sequence while holding the
+	 * SrcMix1 context lock: disabled output, DSB, armed DMA, then 0x10001.
+	 * No diagnostic file I/O is performed with interrupts suspended.
+	 */
+	interrupt_state = ksceKernelSpinlockLowLockCpuSuspendIntr(
+		g_srcmix1_spinlock);
+	if (*g_srcmix1_output_mode != 0 ||
+	    *g_srcmix2_input1_state != 0 ||
+	    g_srcmix1_regs[SRCMIX_SECONDARY_CONTROL_INDEX] !=
+		    SRCMIX_SECONDARY_CONTROL_DISABLED) {
+		ret = SCE_UDCD_ERROR_DRIVER_IN_PROGRESS;
+		setup_ret = ret;
+		goto unlock;
+	}
+
+	g_srcmix1_regs[SRCMIX_SECONDARY_CONTROL_INDEX] =
+		SRCMIX_SECONDARY_CONTROL_DISABLED;
+	audio_data_sync_barrier();
+
+	setup_ret = ksceKernelDmaOpSetupChain(g_capture_dma_op_id,
 		g_capture_dma_period[0].tag,
 		(SceKernelDmaOpChainParam *)&g_capture_dma_chain_param,
 		SCE_KERNEL_DMA_OP_VIRTUAL_DST_ADDR);
-	diagnostic_record("setup SrcMix1 aux DMA", ret);
+	ret = setup_ret;
 	if (ret < 0)
-		return ret;
+		goto unlock;
 	setup_done = 1;
 
 	for (period = 1;
 	     period < AUDIO_CAPTURE_INITIAL_QUEUE_DEPTH;
 	     period++) {
-		ret = ksceKernelDmaOpConcatenate(g_capture_dma_op_id,
+		append_attempted = 1;
+		append_ret = ksceKernelDmaOpConcatenate(g_capture_dma_op_id,
 			g_capture_dma_period[period].tag,
 			SCE_KERNEL_DMA_OP_VIRTUAL_DST_ADDR);
-		diagnostic_record("append SrcMix1 aux DMA period", ret);
+		ret = append_ret;
 		if (ret < 0)
-			goto fail;
+			goto unlock;
 	}
 
 	ksceKernelAtomicSet32(&g_capture_dma_running, 1);
-	ret = ksceKernelDmaOpEnQueue(g_capture_dma_op_id);
-	diagnostic_record("enqueue SrcMix1 aux DMA", ret);
+	enqueue_attempted = 1;
+	enqueue_ret = ksceKernelDmaOpEnQueue(g_capture_dma_op_id);
+	ret = enqueue_ret;
 	if (ret < 0) {
 		ksceKernelAtomicSet32(&g_capture_dma_running, 0);
-		goto fail;
+		goto unlock;
 	}
 
-	g_srcmix_aux_regs[SRCMIX_AUX_CONTROL_REGISTER] = SRCMIX_AUX_ENABLE;
-	audio_srcmix_barrier();
-	return 0;
+	g_srcmix1_regs[SRCMIX_SECONDARY_CONTROL_INDEX] =
+		SRCMIX_SECONDARY_CONTROL_ENABLED;
+	audio_data_sync_barrier();
+	ret = 0;
 
-fail:
+unlock:
+	ksceKernelSpinlockLowUnlockCpuResumeIntr(g_srcmix1_spinlock,
+		interrupt_state);
+	diagnostic_record("setup SrcMix1 secondary DMA", setup_ret);
+	if (append_attempted)
+		diagnostic_record("append SrcMix1 secondary DMA period",
+			append_ret);
+	if (enqueue_attempted)
+		diagnostic_record("enqueue SrcMix1 secondary DMA", enqueue_ret);
+	if (ret >= 0) {
+		diagnostic_record("enable SrcMix1 secondary output",
+			(int)g_srcmix1_regs[SRCMIX_SECONDARY_CONTROL_INDEX]);
+		return 0;
+	}
+
 	if (setup_done) {
 		int quit_ret = ksceKernelDmaOpQuit(g_capture_dma_op_id);
-		diagnostic_record("quit failed SrcMix1 aux start", quit_ret);
+		diagnostic_record("quit failed SrcMix1 secondary start",
+			quit_ret);
 		if (quit_ret < 0)
 			return quit_ret;
 	}
@@ -750,18 +817,31 @@ fail:
 
 static int audio_capture_dma_stop(void)
 {
+	SceKernelIntrStatus interrupt_state;
 	unsigned int ignored;
+	uint32_t secondary_control = SRCMIX_SECONDARY_CONTROL_DISABLED;
 	int dequeue_ret;
 	int quit_ret;
 	int was_running;
 
 	was_running = ksceKernelAtomicGetAndSet32(&g_capture_dma_running, 0);
-	if (g_srcmix_aux_regs) {
-		g_srcmix_aux_regs[SRCMIX_AUX_CONTROL_REGISTER] = 0;
-		audio_srcmix_barrier();
-	}
 	if (!was_running)
 		return 0;
+
+	/* Stop the FIFO producer before dismantling its DMA consumer. */
+	if (g_srcmix1_regs && g_srcmix1_spinlock) {
+		interrupt_state = ksceKernelSpinlockLowLockCpuSuspendIntr(
+			g_srcmix1_spinlock);
+		g_srcmix1_regs[SRCMIX_SECONDARY_CONTROL_INDEX] =
+			SRCMIX_SECONDARY_CONTROL_DISABLED;
+		audio_data_sync_barrier();
+		secondary_control =
+			g_srcmix1_regs[SRCMIX_SECONDARY_CONTROL_INDEX];
+		ksceKernelSpinlockLowUnlockCpuResumeIntr(g_srcmix1_spinlock,
+			interrupt_state);
+	}
+	diagnostic_record("disable SrcMix1 secondary output",
+		(int)secondary_control);
 
 	/*
 	 * Quit releases the operation's tags but does not unlink an operation
@@ -770,15 +850,15 @@ static int audio_capture_dma_stop(void)
 	 * two expected races with normal DMAC4 progress.
 	 */
 	dequeue_ret = ksceKernelDmaOpDeQueue(g_capture_dma_op_id);
-	diagnostic_record("dequeue SrcMix1 aux DMA", dequeue_ret);
+	diagnostic_record("dequeue SrcMix1 secondary DMA", dequeue_ret);
 
 	quit_ret = ksceKernelDmaOpQuit(g_capture_dma_op_id);
-	diagnostic_record("quit SrcMix1 aux DMA", quit_ret);
+	diagnostic_record("quit SrcMix1 secondary DMA", quit_ret);
 	if (quit_ret < 0)
 		return quit_ret;
 	if (dequeue_ret < 0 &&
-	    dequeue_ret != SCE_KERNEL_ERROR_NOT_QUEUED &&
-	    dequeue_ret != SCE_KERNEL_ERROR_ON_TRANSFERRING)
+	    dequeue_ret != (int)SCE_KERNEL_ERROR_NOT_QUEUED &&
+	    dequeue_ret != (int)SCE_KERNEL_ERROR_ON_TRANSFERRING)
 		return dequeue_ret;
 
 	ksceKernelAtomicSet32(&g_capture_dma_done_mask, 0);
@@ -1096,7 +1176,7 @@ static int audio_capture_run(unsigned int generation)
 	int ret;
 
 	ret = audio_capture_dma_start();
-	diagnostic_record("start SrcMix1 aux capture", ret);
+	diagnostic_record("start SrcMix1 secondary capture", ret);
 	if (ret < 0) {
 		audio_signal_failure();
 		return 0;
@@ -1115,7 +1195,8 @@ static int audio_capture_run(unsigned int generation)
 			SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR_PAT,
 			&out_bits, &timeout);
 		if (ret < 0) {
-			diagnostic_record("SrcMix1 aux DMA wait timeout", ret);
+			diagnostic_record("SrcMix1 secondary DMA wait timeout",
+				ret);
 			audio_signal_failure();
 			break;
 		}
@@ -1128,13 +1209,13 @@ static int audio_capture_run(unsigned int generation)
 		dma_error =
 			ksceKernelAtomicGetAndSet32(&g_capture_dma_error, 0);
 		if (dma_error) {
-			diagnostic_record("SrcMix1 aux DMA error stage",
+			diagnostic_record("SrcMix1 secondary DMA error stage",
 				ksceKernelAtomicGetAndAdd32(
 					&g_capture_dma_error_stage, 0));
-			diagnostic_record("SrcMix1 aux DMA error status",
+			diagnostic_record("SrcMix1 secondary DMA error status",
 				ksceKernelAtomicGetAndAdd32(
 					&g_capture_dma_error_status, 0));
-			diagnostic_record("SrcMix1 aux DMA error bytes",
+			diagnostic_record("SrcMix1 secondary DMA error bytes",
 				ksceKernelAtomicGetAndAdd32(
 					&g_capture_dma_error_bytes, 0));
 			audio_signal_failure();
@@ -1156,7 +1237,7 @@ static int audio_capture_run(unsigned int generation)
 			 */
 			if (!(done_mask & expected_mask)) {
 				diagnostic_record(
-					"SrcMix1 aux DMA period order",
+					"SrcMix1 secondary DMA period order",
 					(int)done_mask);
 				audio_signal_failure();
 				break;
@@ -1491,7 +1572,7 @@ int uac_audio_start(void)
 	if (ret < 0)
 		goto out;
 
-	ret = audio_resolve_srcmix_aux();
+	ret = audio_resolve_srcmix1_secondary();
 	if (ret < 0)
 		goto out;
 

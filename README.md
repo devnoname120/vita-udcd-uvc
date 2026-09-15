@@ -14,9 +14,11 @@ The [hardware color space converter](https://wiki.henkaku.xyz/vita/IFTU_Register
 controller directly performs a DMA transfer from the physical address of the resulting converted framebuffer, and therefore, saving CPU usage and power consumption.
 
 Audio is exposed to the computer as a USB Audio Class 1.0 capture/input device
-using 48 kHz, stereo, signed 16-bit PCM. It captures the final mix produced by
-SceAudio and SceAudioSource before the handheld codec applies
-speaker/headphone volume or mute. It does not capture the microphone.
+using 48 kHz, stereo, signed 16-bit PCM. On firmware 3.60 it captures the normal
+handheld mix from SourceMixer1's non-destructive secondary output while the
+normal main output continues feeding the I2S7 speaker/headphone path. The tap is
+after SceAudio and SceAudioSource have been mixed and before the codec applies
+analog volume or mute. It does not capture the microphone.
 
 ## Supported formats and resolutions
 
@@ -59,8 +61,9 @@ If you use Windows 10 you might have to change the Camera access permissions on 
 
 On Linux I recommend using *mplayer* (`mplayer tv:// -tv driver=v4l2:device=/dev/videoX:width=960:height=544`).
 
-The Vita's Bluetooth audio path uses the same single firmware monitor slot as
-USB audio capture. Do not use Bluetooth audio while USB audio streaming is
-active; simultaneous use is not supported.
+USB audio captures firmware 3.60's normal SourceMixer1 handheld mix immediately
+before its main output is sent to I2S7. Audio routed exclusively to Bluetooth,
+HDMI, or other hardware outputs is not guaranteed to be present in the USB
+capture.
 
 Note: Remember that if anything goes wrong (like PSVita not booting) you can always press L at boot to skip plugin loading.
