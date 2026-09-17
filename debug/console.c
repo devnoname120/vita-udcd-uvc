@@ -10,7 +10,7 @@
 
 static int console_x = 16;
 static int console_y = 16;
-static int64_t mutex[8];
+static SceKernelFastMutex mutex __attribute__((aligned(8)));
 
 int console_init()
 {
@@ -19,7 +19,7 @@ int console_init()
 
 int console_fini()
 {
-	return ksceKernelDeleteFastMutex(&mutex);
+	return ksceKernelFinalizeFastMutex(&mutex);
 }
 
 void console_print(const char *s)

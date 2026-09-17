@@ -85,7 +85,7 @@ void clear_screen()
 
 	memset(fb.base, 0x00, SCREEN_PITCH * SCREEN_H * 4);
 	//fill_fb(fb.base, RGBA8(0x80, 0x80, 0x80, 0xFF));
-	ksceKernelCpuDcacheWritebackRange(fb.base, SCREEN_PITCH * SCREEN_H * 4);
+	ksceKernelDcacheCleanRangeForL1WBWA(fb.base, SCREEN_PITCH * SCREEN_H * 4);
 }
 
 void draw_pixel(uint32_t x, uint32_t y, uint32_t color)
@@ -95,7 +95,7 @@ void draw_pixel(uint32_t x, uint32_t y, uint32_t color)
 
 	uint32_t *p = &((uint32_t *)fb.base)[x + y * fb.pitch];
 	*p = color;
-	ksceKernelCpuDcacheWritebackRange(p, sizeof(*p));
+	ksceKernelDcacheCleanRangeForL1WBWA(p, sizeof(*p));
 }
 
 void draw_rectangle(uint32_t x, uint32_t y, uint32_t w, uint32_t h, uint32_t color)
