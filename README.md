@@ -1,4 +1,4 @@
-# PSVita UDCD USB Video Class plugin
+# PSVita UDCD USB Video Class plugin + audio streaming support
 
 ## What's this?
 
