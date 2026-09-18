@@ -97,6 +97,8 @@ static SceUID uvc_thread_id;
 static SceUID uvc_event_flag_id;
 static atomic_int uvc_thread_run;
 static atomic_int stream;
+static atomic_uint uvc_capture_interval = 166666;
+static atomic_uint uvc_pacing_epoch;
 static int uvc_driver_registered;
 
 #if defined(DISPLAY_OFF_OLED) || defined(DISPLAY_OFF_LCD)
@@ -180,6 +182,9 @@ static void uvc_handle_video_streaming_req_recv(const SceUdcdEP0DeviceRequest *r
 			    uvc_probe_control_setting.bFormatIndex,
 			    uvc_probe_control_setting.bmFramingInfo);
 
+			atomic_store_explicit(&uvc_capture_interval,
+				streaming_control->dwFrameInterval, memory_order_relaxed);
+			atomic_fetch_add_explicit(&uvc_pacing_epoch, 1, memory_order_release);
 			stream = 1;
 			ksceKernelSetEventFlag(uvc_event_flag_id, 1);
 			break;
@@ -636,23 +641,44 @@ static int send_frame(void)
 
 static int display_vblank_cb_func(int notifyId, int notifyCount, int notifyArg, void *common)
 {
-	static unsigned int frames = 0;
-	unsigned int elapsed;
+	static uint64_t phase;
+	static uint64_t period;
+	static unsigned int last_interval;
+	static unsigned int last_epoch;
+	unsigned int interval, epoch;
 
-	/*LOG("VBlank: %d, %d, %d, %p\n", notifyId, notifyCount, notifyArg, common);*/
-
-	if (!stream)
+	if (!stream) {
+		phase = 0;
+		return 0;
+	}
+	if (notifyCount <= 0)
 		return 0;
 
-	/*
-	 * VBlanks occur at ~60FPS.
-	 */
-	frames += notifyCount;
-	elapsed = FPS_TO_INTERVAL(60 / frames);
+	epoch = atomic_load_explicit(&uvc_pacing_epoch, memory_order_acquire);
+	interval = atomic_load_explicit(&uvc_capture_interval, memory_order_relaxed);
+	if (!period || interval != last_interval || epoch != last_epoch) {
+		phase = 0;
+		last_interval = interval;
+		last_epoch = epoch;
+		period = (uint64_t)interval * 60u;
 
-	if (elapsed >= uvc_probe_control_setting.dwFrameInterval) {
+		/* A 100 ns rounding difference must not cost a whole vblank. */
+		uint64_t remainder = period % 10000000u;
+		if (remainder <= 60u)
+			period -= remainder;
+		else if (10000000u - remainder <= 60u)
+			period += 10000000u - remainder;
+		if (period < 10000000u)
+			period = 10000000u;
+	}
+
+	phase += (uint64_t)notifyCount * 10000000u;
+	if (phase >= period) {
+		phase -= period;
+		/* Delayed callbacks must not generate a backlog of stale captures. */
+		if (phase >= period)
+			phase %= period;
 		ksceKernelSetEventFlag(uvc_event_flag_id, 1);
-		frames = 0;
 	}
 
 	return 0;

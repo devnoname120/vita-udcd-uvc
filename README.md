@@ -80,6 +80,12 @@ target Vita and host. The overlap is adapted from
 with explicit buffer ownership and without removing 720p. Video remains
 uncompressed NV12, using IFTU and USB DMA; the audio implementation is unchanged.
 
+Capture pacing uses integer arithmetic at the nominal 60 Hz vblank cadence.
+It tolerates either rounding of the supported frame intervals, retains the
+fractional remainder, and coalesces delayed notifications instead of queuing
+stale captures. Timing changes take effect on COMMIT, not while the host is
+still probing, and a new COMMIT resets the pacing phase.
+
 ### Host tests
 
 ```sh
