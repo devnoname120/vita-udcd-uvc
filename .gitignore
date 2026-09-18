@@ -1,0 +1,7 @@
+*.skprx
+*.d
+*.o
+*.elf
+*.velf
+builds/
+tests/.build/

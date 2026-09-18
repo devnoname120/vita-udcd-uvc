@@ -7,10 +7,12 @@
 #include <psp2kern/lowio/iftu.h>
 #include <taihen.h>
 #include <string.h>
+#include <stdatomic.h>
 #include "audio.h"
 #include "diagnostic.h"
 #include "usb_descriptors.h"
 #include "uvc.h"
+#include "video.h"
 
 #ifdef DEBUG
 
@@ -34,12 +36,6 @@
 
 #define UVC_DRIVER_NAME			"VITAUVC00"
 #define UVC_USB_PID			0x1337
-
-#define MAX_UVC_VIDEO_FRAME_SIZE	VIDEO_FRAME_SIZE_NV12(1280, 720)
-
-#define UVC_PAYLOAD_HEADER_SIZE		12
-#define UVC_PAYLOAD_SIZE(frame_size)	(UVC_PAYLOAD_HEADER_SIZE + (frame_size))
-#define MAX_UVC_PAYLOAD_TRANSFER_SIZE	UVC_PAYLOAD_SIZE(MAX_UVC_VIDEO_FRAME_SIZE)
 
 #define SCE_DISPLAY_PIXELFORMAT_BGRA5551 0x50000000
 
@@ -71,17 +67,6 @@ typedef struct SceIftuPlaneState_updated {
 _Static_assert(sizeof(SceIftuPlaneState_updated) == 0x54,
 	"unexpected SceIftuPlaneState_updated size");
 
-/*
- * We want the data field (raw pixel data) to be aligned to 16B for the IFTU CSC to work properly.
- * It seems the USB controller is fine with data aligned to 4B (starts reading from header field).
- */
-#define UVC_FRAME_PADDING_SIZE (16 - UVC_PAYLOAD_HEADER_SIZE)
-struct uvc_frame {
-	unsigned char padding[UVC_FRAME_PADDING_SIZE];
-	unsigned char header[UVC_PAYLOAD_HEADER_SIZE];
-	unsigned char data[];
-} __attribute__((packed));
-
 static const struct uvc_streaming_control uvc_probe_control_setting_default = {
 	.bmHint				= 0,
 	.bFormatIndex			= FORMAT_INDEX_UNCOMPRESSED_NV12,
@@ -110,15 +95,9 @@ static struct {
 
 static SceUID uvc_thread_id;
 static SceUID uvc_event_flag_id;
-static int uvc_thread_run;
-static int stream;
-
-static SceUID uvc_frame_buffer_uid = -1;
-static struct uvc_frame *uvc_frame_buffer_addr;
-SceUID uvc_frame_req_evflag;
-
-static int uvc_frame_init(unsigned int size);
-static int uvc_frame_term();
+static atomic_int uvc_thread_run;
+static atomic_int stream;
+static int uvc_driver_registered;
 
 #if defined(DISPLAY_OFF_OLED) || defined(DISPLAY_OFF_LCD)
 static int prev_brightness;
@@ -171,61 +150,6 @@ static int usb_ep0_enqueue_recv_for_req(const SceUdcdEP0DeviceRequest *ep0_req)
 		pending_recv.ep0_req.wLength);
 
 	return ksceUdcdReqRecv(&req);
-}
-
-static int uvc_frame_req_init(void)
-{
-	uvc_frame_req_evflag = ksceKernelCreateEventFlag("uvc_frame_req_evflag", 0, 0, NULL);
-	if (uvc_frame_req_evflag < 0) {
-		return uvc_frame_req_evflag;
-	}
-
-	return 0;
-}
-
-static int uvc_frame_req_fini(void)
-{
-	int ret;
-
-	ret = ksceKernelDeleteEventFlag(uvc_frame_req_evflag);
-	if (ret < 0)
-		return ret;
-
-	return 0;
-}
-
-static void uvc_frame_req_submit_phycont_on_complete(SceUdcdDeviceRequest *req)
-{
-	ksceKernelSetEventFlag(uvc_frame_req_evflag, 1);
-}
-
-static int uvc_frame_req_submit_phycont(const void *data, unsigned int size)
-{
-	static SceUdcdDeviceRequest req;
-	int ret;
-
-	req = (SceUdcdDeviceRequest){
-		.endpoint = &endpoints[1],
-		.data = (void *)data,
-		.attributes = SCE_UDCD_DEVICE_REQUEST_ATTR_PHYCONT,
-		.size = size,
-		.isControlRequest = 0,
-		.onComplete = uvc_frame_req_submit_phycont_on_complete,
-		.transmitted = 0,
-		.returnCode = 0,
-		.next = NULL,
-		.unused = NULL,
-		.physicalAddress = NULL
-	};
-
-	ret = ksceUdcdReqSend(&req);
-	if (ret < 0)
-		return ret;
-
-	ret = ksceKernelWaitEventFlagCB(uvc_frame_req_evflag, 1, SCE_EVENT_WAITOR |
-					SCE_EVENT_WAITCLEAR_PAT, NULL, NULL);
-
-	return ret;
 }
 
 static void uvc_handle_video_streaming_req_recv(const SceUdcdEP0DeviceRequest *req)
@@ -540,29 +464,6 @@ static SceUdcdDriver uvc_udcd_driver = {
 	.user_data			= NULL
 };
 
-static unsigned int uvc_frame_transfer(struct uvc_frame *frame,
-				       unsigned int frame_size,
-				       int fid, int eof)
-{
-	int ret;
-
-	frame->header[0] = UVC_PAYLOAD_HEADER_SIZE;
-	frame->header[1] = UVC_STREAM_EOH;
-
-	if (fid)
-		frame->header[1] |= UVC_STREAM_FID;
-	if (eof)
-		frame->header[1] |= UVC_STREAM_EOF;
-
-	ret = uvc_frame_req_submit_phycont(frame->header, frame_size);
-	if (ret < 0) {
-		LOG("Error sending frame: 0x%08X\n", ret);
-		return ret;
-	}
-
-	return 0;
-}
-
 int uvc_start(void);
 int uvc_stop(void);
 
@@ -588,10 +489,9 @@ static inline unsigned int display_pixelformat_bpp(unsigned int fmt)
 	}
 }
 
-static int frame_convert_to_nv12(int fid, const SceDisplayFrameBufInfo *fb_info,
+static int frame_convert_to_nv12(uintptr_t dst_paddr, const SceDisplayFrameBufInfo *fb_info,
 					int dst_width, int dst_height)
 {
-	uintptr_t dst_paddr;
 	uintptr_t src_paddr = fb_info->paddr;
 	unsigned int src_width = fb_info->framebuf.width;
 	unsigned int src_width_aligned = ALIGN(src_width, 16);
@@ -599,7 +499,6 @@ static int frame_convert_to_nv12(int fid, const SceDisplayFrameBufInfo *fb_info,
 	unsigned int src_height = fb_info->framebuf.height;
 	unsigned int src_pixelfmt = fb_info->framebuf.pixelformat;
 	unsigned int src_pixelfmt_bpp = display_pixelformat_bpp(src_pixelfmt);
-	unsigned char *uvc_frame_data = uvc_frame_buffer_addr->data;
 
 	static SceIftuCscParams RGB_to_YCbCr_JPEG_csc_params = {
 		0, 0x202, 0x3FF,
@@ -610,8 +509,6 @@ static int frame_convert_to_nv12(int fid, const SceDisplayFrameBufInfo *fb_info,
 			{0x100, 0xF2A, 0xFD7}
 		}
 	};
-
-	ksceKernelGetPaddr(uvc_frame_data, &dst_paddr);
 
 	SceIftuConvParams params;
 	memset(&params, 0, sizeof(params));
@@ -661,43 +558,37 @@ static int frame_convert_to_nv12(int fid, const SceDisplayFrameBufInfo *fb_info,
 	return ksceIftuCsc(&dst, (SceIftuPlaneState *)&src, &params);
 }
 
-static int convert_and_send_frame_nv12(int fid, const SceDisplayFrameBufInfo *fb_info,
-					int dst_width, int dst_height)
-{
-	int ret;
-	uint64_t time1, time2, time3;
-	UNUSED(time1);
-	UNUSED(time2);
-	UNUSED(time3);
-
-	time1 = ksceKernelGetSystemTimeWide();
-
-	ret = frame_convert_to_nv12(fid, fb_info, dst_width, dst_height);
-	if (ret < 0)
-		return ret;
-
-	time2 = ksceKernelGetSystemTimeWide();
-
-	ret = uvc_frame_transfer(uvc_frame_buffer_addr,
-				 UVC_PAYLOAD_SIZE(VIDEO_FRAME_SIZE_NV12(dst_width, dst_height)),
-				 fid, 1);
-	if (ret < 0)
-		return ret;
-
-	time3 = ksceKernelGetSystemTimeWide();
-	LOG("NV12 CSC: %lldus xfer: %lldus\n", time2 - time1, time3 - time2);
-
-	return 0;
-}
-
 static int send_frame(void)
 {
-	static int fid = 0;
-
-	int ret;
+	static int fid;
+	const struct UVC_FRAME_UNCOMPRESSED(2) *frames =
+		video_streaming_descriptors.frames_uncompressed_nv12;
+	unsigned int frame_index = uvc_probe_control_setting.bFrameIndex;
+	unsigned int format_index = uvc_probe_control_setting.bFormatIndex;
+	unsigned int frame_count = sizeof(video_streaming_descriptors.frames_uncompressed_nv12) /
+		sizeof(video_streaming_descriptors.frames_uncompressed_nv12[0]);
+	struct uvc_video_buffer buffer;
 	SceDisplayFrameBufInfo fb_info;
-	int head = ksceDisplayGetPrimaryHead();
+	int ret, head, dst_width, dst_height;
+#ifdef DEBUG
+	uint64_t time1, time2, time3;
+#endif
 
+	if (format_index != FORMAT_INDEX_UNCOMPRESSED_NV12 ||
+		frame_index < 1 || frame_index > frame_count)
+		return SCE_UDCD_ERROR_INVALID_ARGUMENT;
+
+	dst_width = frames[frame_index - 1].wWidth;
+	dst_height = frames[frame_index - 1].wHeight;
+	ret = uvc_video_prepare(VIDEO_FRAME_SIZE_NV12(dst_width, dst_height), &buffer);
+	if (ret < 0)
+		return ret;
+	if (!uvc_thread_run || !stream ||
+		frame_index != uvc_probe_control_setting.bFrameIndex ||
+		format_index != uvc_probe_control_setting.bFormatIndex)
+		return 0;
+
+	head = ksceDisplayGetPrimaryHead();
 	memset(&fb_info, 0, sizeof(fb_info));
 	fb_info.size = sizeof(fb_info);
 	ret = ksceDisplayGetProcFrameBufInternal(-1, head, 0, &fb_info);
@@ -705,44 +596,41 @@ static int send_frame(void)
 		ret = ksceDisplayGetProcFrameBufInternal(-1, head, 1, &fb_info);
 	if (ret < 0)
 		return ret;
+	if (!fb_info.paddr)
+		return SCE_UDCD_ERROR_INVALID_ARGUMENT;
 
-	switch (uvc_probe_control_setting.bFormatIndex) {
-	case FORMAT_INDEX_UNCOMPRESSED_NV12: {
-		const struct UVC_FRAME_UNCOMPRESSED(2) *frames =
-			video_streaming_descriptors.frames_uncompressed_nv12;
-		int cur_frame_index = uvc_probe_control_setting.bFrameIndex;
-		int dst_width = frames[cur_frame_index - 1].wWidth;
-		int dst_height = frames[cur_frame_index - 1].wHeight;
-
-		static int last_frame_index = 0;
-		if (uvc_frame_buffer_uid < 0 || cur_frame_index != last_frame_index) {
-			uvc_frame_term();
-			ret = uvc_frame_init(UVC_FRAME_PADDING_SIZE + VIDEO_FRAME_SIZE_NV12(dst_width, dst_height));
-			if (ret < 0) {
-				LOG("Error allocating the UVC frame (0x%08X)\n", ret);
-				return ret;
-			} else {
-				last_frame_index = cur_frame_index;
-			}
-		}
-
-		ret = convert_and_send_frame_nv12(fid, &fb_info, dst_width, dst_height);
-		if (ret < 0) {
-			LOG("Error sending NV12 frame: 0x%08X\n", ret);
-			return ret;
-		}
-
-		break;
-	}
-	}
-
-	if (ret < 0) {
-		stream = 0;
+#ifdef DEBUG
+	time1 = ksceKernelGetSystemTimeWide();
+#endif
+	ret = frame_convert_to_nv12(buffer.data_paddr, &fb_info, dst_width, dst_height);
+	if (ret < 0)
 		return ret;
-	}
+#ifdef DEBUG
+	time2 = ksceKernelGetSystemTimeWide();
+#endif
 
+	ret = uvc_video_wait();
+	if (ret < 0)
+		return ret;
+	if (!uvc_thread_run || !stream ||
+		frame_index != uvc_probe_control_setting.bFrameIndex ||
+		format_index != uvc_probe_control_setting.bFormatIndex)
+		return 0;
+
+	ret = uvc_video_submit(fid);
+	if (ret < 0)
+		return ret;
 	fid ^= 1;
 
+	/* A stop can race the enqueue even after the pre-submit check. */
+	if (!uvc_thread_run || !stream ||
+		frame_index != uvc_probe_control_setting.bFrameIndex ||
+		format_index != uvc_probe_control_setting.bFormatIndex)
+		uvc_video_cancel();
+#ifdef DEBUG
+	time3 = ksceKernelGetSystemTimeWide();
+	LOG("NV12 CSC: %lldus prior xfer wait/queue: %lldus\n", time2 - time1, time3 - time2);
+#endif
 	return 0;
 }
 
@@ -790,11 +678,22 @@ static int uvc_thread(SceSize args, void *argp)
 	diagnostic_record("uvc_thread entered", 0);
 	start_result = uvc_start();
 	diagnostic_record("uvc_start", start_result);
+	if (start_result < 0)
+		return start_result;
 
 	display_vblank_cb_uid = ksceKernelCreateCallback("uvc_display_vblank", 0,
 							 display_vblank_cb_func, NULL);
 
-	ksceDisplayRegisterVblankStartCallback(display_vblank_cb_uid);
+	if (display_vblank_cb_uid < 0) {
+		uvc_stop();
+		return display_vblank_cb_uid;
+	}
+	int callback_ret = ksceDisplayRegisterVblankStartCallback(display_vblank_cb_uid);
+	if (callback_ret < 0) {
+		ksceKernelDeleteCallback(display_vblank_cb_uid);
+		uvc_stop();
+		return callback_ret;
+	}
 
 	while (uvc_thread_run) {
 		unsigned int out_bits;
@@ -803,74 +702,31 @@ static int uvc_thread(SceSize args, void *argp)
 			SCE_EVENT_WAITOR | SCE_EVENT_WAITCLEAR_PAT,
 			&out_bits, (SceUInt32[]){1000000});
 
-		if (ret == 0 && stream)
-			send_frame();
-		else if (ret == 0x80028005) /* SCE_KERNEL_ERROR_WAIT_TIMEOUT */
-			uvc_frame_term();
+		if (!uvc_thread_run)
+			break;
+		if (ret == 0 && stream) {
+			ret = send_frame();
+			if (ret < 0)
+				LOG("Error processing NV12 frame: 0x%08X\n", ret);
+		} else if (ret == (int)0x80028005) {
+			if (!stream)
+				uvc_video_cancel();
+			uvc_video_release();
+		}
 	}
 
 	ksceDisplayUnregisterVblankStartCallback(display_vblank_cb_uid);
 	ksceKernelDeleteCallback(display_vblank_cb_uid);
 
-	uvc_stop();
-
-	return 0;
-}
-
-static int uvc_frame_init(unsigned int size)
-{
-	int ret;
-
-	const int use_cdram = 0;
-	SceKernelAllocMemBlockKernelOpt opt;
-	SceKernelMemBlockType type;
-	SceKernelAllocMemBlockKernelOpt *optp;
-
-	if (use_cdram) {
-		type = 0x40408006;
-		size = ALIGN(size, 256 * 1024);
-		optp = NULL;
-	} else {
-		type = 0x10208006;
-		size = ALIGN(size, 4 * 1024);
-		memset(&opt, 0, sizeof(opt));
-		opt.size = sizeof(opt);
-		opt.attr = SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_PHYCONT |
-			   SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT;
-		opt.alignment = 4 * 1024;
-		optp = &opt;
-	}
-
-	uvc_frame_buffer_uid = ksceKernelAllocMemBlock("uvc_frame_buffer", type, size, optp);
-	if (uvc_frame_buffer_uid < 0) {
-		LOG("Error allocating CSC dest memory: 0x%08X\n", uvc_frame_buffer_uid);
-		return uvc_frame_buffer_uid;
-	}
-
-	ret = ksceKernelGetMemBlockBase(uvc_frame_buffer_uid, (void **)&uvc_frame_buffer_addr);
-	if (ret < 0) {
-		LOG("Error getting CSC desr memory addr: 0x%08X\n", ret);
-		ksceKernelFreeMemBlock(uvc_frame_buffer_uid);
-		uvc_frame_buffer_uid = -1;
-		return ret;
-	}
-
-	return 0;
-}
-
-static int uvc_frame_term()
-{
-	if (uvc_frame_buffer_uid >= 0) {
-		ksceKernelFreeMemBlock(uvc_frame_buffer_uid);
-		uvc_frame_buffer_uid = -1;
-	}
-
-	return 0;
+	return uvc_stop();
 }
 
 int uvc_start(void)
 {
 	int ret;
+
+	memcpy(&uvc_probe_control_setting, &uvc_probe_control_setting_default,
+		sizeof(uvc_probe_control_setting));
 
 	/*
 	 * Wait until there's a framebuffer set.
@@ -919,23 +775,8 @@ int uvc_start(void)
 		goto err_activate;
 	}
 
-	ret = uvc_frame_req_init();
-	diagnostic_record("uvc_frame_req_init", ret);
-	if (ret < 0) {
-		LOG("Error allocating USB request (0x%08X)\n", ret);
-		goto err_alloc_uvc_frame_req;
-	}
-
-	/*
-	 * Set the current streaming settings to the default ones.
-	 */
-	memcpy(&uvc_probe_control_setting, &uvc_probe_control_setting_default,
-	       sizeof(uvc_probe_control_setting));
-
 	return 0;
 
-err_alloc_uvc_frame_req:
-	ksceUdcdDeactivate();
 err_activate:
 	ksceUdcdStop(UVC_DRIVER_NAME, 0, NULL);
 err_start_uvc_driver:
@@ -951,14 +792,17 @@ int uvc_stop(void)
 	if (ret < 0)
 		LOG("Error stopping UAC audio (0x%08X)\n", ret);
 
+	uvc_video_cancel();
+	ret = uvc_video_release();
+	if (ret < 0)
+		return ret;
+
 	ksceUdcdDeactivate();
 	ksceUdcdStop(UVC_DRIVER_NAME, 0, NULL);
 	ksceUdcdStop("USBDeviceControllerDriver", 0, NULL);
 	ksceUdcdStart("USBDeviceControllerDriver", 0, NULL);
 	ksceUdcdStart("USB_MTP_Driver", 0, NULL);
 	ksceUdcdActivate(0x4E4);
-
-	uvc_frame_term();
 
 	return 0;
 }
@@ -1039,11 +883,16 @@ int module_start(SceSize argc, const void *args)
 		goto err_destroy_thread;
 	}
 
+	ret = uvc_video_init(&endpoints[1]);
+	diagnostic_record("uvc_video_init", ret);
+	if (ret < 0)
+		goto err_delete_event_flag;
+
 	ret = uac_audio_init(&endpoints[2]);
 	diagnostic_record("uac_audio_init", ret);
 	if (ret < 0) {
 		LOG("Error initializing UAC audio (0x%08X)\n", ret);
-		goto err_delete_event_flag;
+		goto err_video_term;
 	}
 
 	ret = ksceUdcdRegister(&uvc_udcd_driver);
@@ -1052,6 +901,7 @@ int module_start(SceSize argc, const void *args)
 		LOG("Error registering the UDCD driver (0x%08X)\n", ret);
 		goto err_audio_term;
 	}
+	uvc_driver_registered = 1;
 
 	uvc_thread_run = 1;
 
@@ -1066,9 +916,12 @@ int module_start(SceSize argc, const void *args)
 	return SCE_KERNEL_START_SUCCESS;
 
 err_unregister:
-	ksceUdcdUnregister(&uvc_udcd_driver);
+	if (ksceUdcdUnregister(&uvc_udcd_driver) >= 0)
+		uvc_driver_registered = 0;
 err_audio_term:
 	uac_audio_term();
+err_video_term:
+	uvc_video_term();
 err_delete_event_flag:
 	ksceKernelDeleteEventFlag(uvc_event_flag_id);
 err_destroy_thread:
@@ -1084,22 +937,30 @@ int module_stop(SceSize argc, const void *args)
 		return SCE_KERNEL_STOP_FAIL;
 
 	uvc_thread_run = 0;
+	uvc_handle_video_abort();
 
 	ksceKernelSetEventFlag(uvc_event_flag_id, 1);
-	ksceKernelWaitThreadEnd(uvc_thread_id, NULL, NULL);
-
-	ksceKernelDeleteEventFlag(uvc_event_flag_id);
-	ksceKernelDeleteThread(uvc_thread_id);
-
-	uvc_frame_req_fini();
+	if (ksceKernelWaitThreadEnd(uvc_thread_id, NULL, NULL) < 0)
+		return SCE_KERNEL_STOP_FAIL;
+	if (uvc_video_release() < 0)
+		return SCE_KERNEL_STOP_FAIL;
 
 	ksceUdcdDeactivate();
 	ksceUdcdStop(UVC_DRIVER_NAME, 0, NULL);
 	ksceUdcdStop("USBDeviceControllerDriver", 0, NULL);
-	ksceUdcdUnregister(&uvc_udcd_driver);
+	if (uvc_driver_registered) {
+		if (ksceUdcdUnregister(&uvc_udcd_driver) < 0)
+			return SCE_KERNEL_STOP_FAIL;
+		uvc_driver_registered = 0;
+	}
 
+	if (uvc_video_term() < 0)
+		return SCE_KERNEL_STOP_FAIL;
 	if (uac_audio_term() < 0)
 		return SCE_KERNEL_STOP_FAIL;
+
+	ksceKernelDeleteEventFlag(uvc_event_flag_id);
+	ksceKernelDeleteThread(uvc_thread_id);
 
 	if (SceUdcd_sub_01E1128C_hook_uid > 0) {
 		taiHookReleaseForKernel(SceUdcd_sub_01E1128C_hook_uid,

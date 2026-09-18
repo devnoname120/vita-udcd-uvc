@@ -55,6 +55,42 @@ or the USB cable is disconnected.
 
 * [vitasdk](https://vitasdk.org/) is needed.
 
+### Video pipeline
+
+The default build uses two dynamically sized conversion buffers. The existing
+video worker can convert the next frame while the USB controller transmits the
+previous one; only one USB video request is queued at a time. A buffer is not
+reused or freed until its request completes, including after cancellation.
+All five video modes and the USB audio path are retained.
+
+If the second buffer cannot be allocated, capture falls back to one buffer.
+For a deliberately single-buffer build, use:
+
+```sh
+make clean
+make PARALLEL=0
+```
+
+Run `make clean` before switching build options. The second buffer uses an
+additional 768 KiB at 960x544, or 1352 KiB at 1280x720, while allocated.
+Idle capture releases its buffers. Overlap does not increase USB bandwidth;
+its effect on delivered frame rate and latency still needs measurement on the
+target Vita and host. The overlap is adapted from
+[trap15's change](https://github.com/trap15/vita-udcd-uvc/commit/2ad09ffa8453d8b0ea5bc283566bd25155832236),
+with explicit buffer ownership and without removing 720p. Video remains
+uncompressed NV12, using IFTU and USB DMA; the audio implementation is unchanged.
+
+### Host tests
+
+```sh
+make test
+```
+
+The tests require Python 3 and a native C compiler supporting AddressSanitizer
+and UndefinedBehaviorSanitizer. They exercise the production video transport,
+capture scheduling, and shutdown path with simulated kernel/USB dependencies.
+They do not replace device tests of IFTU, USB timing, or simultaneous audio.
+
 **Installation**:
 
 1. Copy `udcd_uvc.skprx` to your PSVita

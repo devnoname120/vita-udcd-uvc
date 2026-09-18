@@ -1,5 +1,5 @@
 TARGET	= udcd_uvc
-OBJS	= src/main.o src/audio.o
+OBJS	= src/main.o src/audio.o src/video.o
 LIBS	= -lSceSysmemForDriver_stub -lSceThreadmgrForDriver_stub \
 	-lSceCpuForDriver_stub -lSceUdcdForDriver_stub \
 	-lSceDisplayForDriver_stub -lSceIftuForDriver_stub \
@@ -16,6 +16,10 @@ ifeq ($(DIAGNOSTIC), 1)
 	OBJS	+= src/diagnostic.o
 	CFLAGS	+= -DDIAGNOSTIC
 	LIBS	+= -lSceIofilemgrForDriver_stub
+endif
+
+ifeq ($(PARALLEL), 0)
+	CFLAGS	+= -DUVC_FRAMEBUFFER_COUNT=1
 endif
 
 ifeq ($(DISPLAY_OFF_OLED), 1)
@@ -48,7 +52,10 @@ $(TARGET).elf: $(OBJS)
 %.o: %.c
 	$(CC) $(CFLAGS) -MMD -MP -c $< -o $@
 
-.PHONY: clean send
+.PHONY: clean send test
+
+test:
+	$(MAKE) -C tests test
 
 clean:
 	@rm -rf $(TARGET).skprx $(TARGET).velf $(TARGET).elf $(OBJS) $(DEPS)
