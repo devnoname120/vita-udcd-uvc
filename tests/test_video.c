@@ -15,6 +15,7 @@ static struct {
 	struct {
 		void *base;
 		unsigned int size;
+		SceKernelMemBlockType type;
 	} memory[8];
 	SceUdcdDeviceRequest *queued;
 	unsigned char *queued_copy;
@@ -23,6 +24,7 @@ static struct {
 	int alloc_calls, base_calls, paddr_calls, live_blocks;
 	int waits, sends, cancels, deletes;
 	int fail_alloc, fail_base, fail_paddr;
+	int fail_physical_page, fail_contiguous, contiguous_alloc_calls;
 	int fail_event, fail_send, fail_free, fail_delete;
 	int auto_complete, cancel_complete, complete_on_send;
 	int completion_code;
@@ -107,19 +109,28 @@ SceUID ksceKernelAllocMemBlock(const char *name, SceKernelMemBlockType type,
 	SceSize size, SceKernelAllocMemBlockKernelOpt *opt)
 {
 	(void)name;
-	assert(type == 0x10208006);
+	assert(type == 0x10208006 || type == SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_ROOT_PHYCONT_NC_RW);
 	assert(size && !(size & 4095));
 	assert(opt && opt->size == sizeof(*opt));
 	assert(opt->alignment == 4096);
 	assert(opt->attr == (SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_PHYCONT |
 		SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT));
-	if (++mock.alloc_calls == mock.fail_alloc)
+	mock.alloc_calls++;
+	if (type == SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_ROOT_PHYCONT_NC_RW) {
+		mock.contiguous_alloc_calls++;
+		if (mock.fail_contiguous)
+			return MOCK_ERROR;
+	}
+	if (mock.alloc_calls == mock.fail_physical_page)
+		return SCE_KERNEL_ERROR_NO_FREE_PHYSICAL_PAGE;
+	if (mock.alloc_calls == mock.fail_alloc)
 		return MOCK_ERROR;
 	for (unsigned int i = 0; i < 8; i++) {
 		if (!mock.memory[i].base) {
 			mock.memory[i].base = malloc(size);
 			assert(mock.memory[i].base);
 			mock.memory[i].size = size;
+			mock.memory[i].type = type;
 			memset(mock.memory[i].base, 0xCC, size);
 			mock.live_blocks++;
 			return (SceUID)i + 1;
@@ -601,6 +612,58 @@ static void test_capture_conversion_and_transfer_errors(void)
 	teardown();
 }
 
+static void test_contiguous_pool_fallback(void)
+{
+	struct uvc_video_buffer first, next;
+	for (int slot = 1; slot <= UVC_FRAMEBUFFER_COUNT; slot++) {
+		setup();
+		mock.fail_physical_page = slot;
+		assert(uvc_video_prepare(MAX_UVC_VIDEO_FRAME_SIZE, &first) == 0);
+		assert(mock.contiguous_alloc_calls == 1);
+		assert(mock.alloc_calls == UVC_FRAMEBUFFER_COUNT + 1);
+		assert(mock.live_blocks == UVC_FRAMEBUFFER_COUNT);
+		assert(mock.memory[slot - 1].type == SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_ROOT_PHYCONT_NC_RW);
+		fill(&first, MAX_UVC_VIDEO_FRAME_SIZE, 0x45);
+		assert(uvc_video_submit(0) == 0);
+		assert(uvc_video_prepare(MAX_UVC_VIDEO_FRAME_SIZE, &next) == 0);
+		if (UVC_FRAMEBUFFER_COUNT == 2)
+			assert(next.frame != first.frame && mock.queued);
+		else
+			assert(next.frame == first.frame && !mock.queued);
+		teardown();
+
+		setup();
+		mock.fail_physical_page = slot;
+		mock.fail_contiguous = 1;
+		int result = uvc_video_prepare(FRAME_SIZE, &first);
+		assert(result == (slot == 1 ? MOCK_ERROR : 0));
+		assert(mock.contiguous_alloc_calls == 1);
+		assert(mock.live_blocks == slot - 1);
+		teardown();
+
+		for (int operation = 0; operation < 2; operation++) {
+			setup();
+			mock.fail_physical_page = slot;
+			if (operation == 0)
+				mock.fail_base = slot;
+			else
+				mock.fail_paddr = slot;
+			result = uvc_video_prepare(FRAME_SIZE, &first);
+			assert(result == (slot == 1 ? MOCK_ERROR : 0));
+			assert(mock.contiguous_alloc_calls == 1);
+			assert(mock.live_blocks == slot - 1);
+			teardown();
+		}
+
+		setup();
+		mock.fail_alloc = slot;
+		result = uvc_video_prepare(FRAME_SIZE, &first);
+		assert(result == (slot == 1 ? MOCK_ERROR : 0));
+		assert(mock.contiguous_alloc_calls == 0);
+		teardown();
+	}
+}
+
 int main(void)
 {
 	struct uvc_video_buffer buffer;
@@ -610,6 +673,7 @@ int main(void)
 	test_stalled_transfer_retains_resources();
 	test_resolution_changes_and_idle_release();
 	test_allocation_failures();
+	test_contiguous_pool_fallback();
 	test_submission_and_completion_errors();
 	test_synchronous_completion_and_header();
 	test_size_and_alignment();
@@ -620,6 +684,6 @@ int main(void)
 	test_capture_state_changes_during_submit();
 	test_capture_samples_source_after_buffer_wait();
 	test_capture_conversion_and_transfer_errors();
-	printf("video: 14 test groups passed (%d buffer configuration)\n", UVC_FRAMEBUFFER_COUNT);
+	printf("video: 15 test groups passed (%d buffer configuration)\n", UVC_FRAMEBUFFER_COUNT);
 	return 0;
 }

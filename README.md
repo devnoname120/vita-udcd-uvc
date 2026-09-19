@@ -49,7 +49,7 @@ or the USB cable is disconnected.
 
 **Download**:
 
-* [udcd\_uvc.skprx](https://github.com/xerpi/vita-udcd-uvc/releases)
+* [udcd\_uvc.skprx](https://github.com/devnoname120/vita-udcd-uvc/releases)
 
 **Compilation**
 
@@ -63,7 +63,10 @@ previous one; only one USB video request is queued at a time. A buffer is not
 reused or freed until its request completes, including after cancellation.
 All five video modes and the USB audio path are retained.
 
-If the second buffer cannot be allocated, capture falls back to one buffer.
+Allocation first uses the original kernel memory pool. If that pool has no
+free contiguous physical pages, it retries the kernel's dedicated physically
+contiguous, non-cacheable pool. Both pools remain finite shared resources;
+if the second buffer still cannot be allocated, capture falls back to one buffer.
 For a deliberately single-buffer build, use:
 
 ```sh
@@ -74,8 +77,9 @@ make PARALLEL=0
 Run `make clean` before switching build options. The second buffer uses an
 additional 768 KiB at 960x544, or 1352 KiB at 1280x720, while allocated.
 Idle capture releases its buffers. Overlap does not increase USB bandwidth;
-its effect on delivered frame rate and latency still needs measurement on the
-target Vita and host. The overlap is adapted from
+its effect depends on the selected mode and host. See the
+[hardware test report](docs/performance-2026-09-19.md) for measured capture rates
+and the remaining testing limits. The overlap is adapted from
 [trap15's change](https://github.com/trap15/vita-udcd-uvc/commit/2ad09ffa8453d8b0ea5bc283566bd25155832236),
 with explicit buffer ownership and without removing 720p. Video remains
 uncompressed NV12, using IFTU and USB DMA; the audio implementation is unchanged.

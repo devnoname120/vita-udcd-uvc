@@ -1,5 +1,6 @@
 #include <psp2kern/kernel/sysmem.h>
 #include <psp2kern/kernel/threadmgr.h>
+#include <psp2/kernel/error.h>
 #include <string.h>
 #include "uvc.h"
 #include "video.h"
@@ -113,6 +114,10 @@ static int allocate_slot(unsigned int slot, unsigned int frame_size)
 		SCE_KERNEL_ALLOC_MEMBLOCK_ATTR_HAS_ALIGNMENT;
 	opt.alignment = 4096;
 	slots[slot].uid = ksceKernelAllocMemBlock("uvc_frame_buffer", 0x10208006, size, &opt);
+	/* Large DMA buffers may not fit in the ordinary kernel physical pool. */
+	if (slots[slot].uid == (int)SCE_KERNEL_ERROR_NO_FREE_PHYSICAL_PAGE)
+		slots[slot].uid = ksceKernelAllocMemBlock("uvc_frame_buffer",
+			SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_ROOT_PHYCONT_NC_RW, size, &opt);
 	if (slots[slot].uid < 0)
 		return slots[slot].uid;
 

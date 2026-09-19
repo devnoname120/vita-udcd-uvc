@@ -46,6 +46,8 @@ typedef struct SceUdcdDeviceRequest {
 #define SCE_UDCD_ERROR_INVALID_ARGUMENT ((int)0x80243001)
 #define SCE_UDCD_ERROR_DRIVER_IN_PROGRESS ((int)0x80243006)
 #define SCE_KERNEL_ERROR_WAIT_TIMEOUT ((int)0x80028005)
+#define SCE_KERNEL_ERROR_NO_FREE_PHYSICAL_PAGE ((int)0x80024302)
+#define SCE_KERNEL_MEMBLOCK_TYPE_KERNEL_ROOT_PHYCONT_NC_RW 0x30808006
 
 SceUID ksceKernelCreateEventFlag(const char *name, unsigned int attr,
 	unsigned int bits, void *opt);
